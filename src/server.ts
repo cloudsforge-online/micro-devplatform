@@ -193,7 +193,7 @@ export interface ServerDeps {
   readonly ingestSecrets: readonly string[]
   readonly defaultQuotaPerMinute: number
   readonly defaultQuotaPerMonth: number
-  readonly webhookSecretOverlapMinutes: number
+  readonly webhookRotationOverlapMinutes: number
   /** Test seams. Production leaves both undefined and hashes at `CURRENT_PARAMS`. */
   readonly scryptParams?: ScryptParams
   readonly kdf?: Kdf
@@ -927,8 +927,8 @@ function buildRoutes(): Route[] {
         actorOf(caller),
         { endpointId: id },
         async (tx) => {
-          secret = await rotateSecret(tx, id, deps.webhookSecretOverlapMinutes)
-          return { response: { endpointId: id, overlapMinutes: deps.webhookSecretOverlapMinutes }, artefactId: id }
+          secret = await rotateSecret(tx, id, deps.webhookRotationOverlapMinutes)
+          return { response: { endpointId: id, overlapMinutes: deps.webhookRotationOverlapMinutes }, artefactId: id }
         },
       )
       return { ...reply, body: { ...(reply.body as Record<string, unknown>), secret } }

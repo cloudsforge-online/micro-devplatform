@@ -112,7 +112,7 @@ test('the server', { skip }, async (t) => {
     ingestSecrets: [INGEST_SECRET],
     defaultQuotaPerMinute: 600,
     defaultQuotaPerMonth: 1_000_000,
-    webhookSecretOverlapMinutes: 60,
+    webhookRotationOverlapMinutes: 60,
     // The cheap KDF. The properties under test are cost-independent; see testsupport.ts.
     scryptParams: TEST_PARAMS,
   }

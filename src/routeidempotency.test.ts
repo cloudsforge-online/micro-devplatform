@@ -167,7 +167,7 @@ test('EVERY SECRET A RESPONSE CARRIES IS MINTED IN THAT REQUEST, NOT READ FROM A
   const MINTS = [
     'minted = issued.secretKey',
     'secret = created.secret',
-    'secret = await rotateSecret(tx, id, deps.webhookSecretOverlapMinutes)',
+    'secret = await rotateSecret(tx, id, deps.webhookRotationOverlapMinutes)',
     'clientSecret = registered.clientSecret',
   ]
   const assignments = [...SERVER.matchAll(/(?<!let )\b(minted|secret|clientSecret) = ([^\n]+)/g)]

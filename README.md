@@ -265,7 +265,7 @@ deliveries and does not hold the secret, and pretending otherwise would be worse
 are the ones actually available: it is shown once and no route reads it back; it authenticates *us to
 the subscriber* rather than granting access to anything; and it is **rotatable without an outage**,
 which is the control that matters most. Rotation writes a new row and stamps `retires_at` on the old
-one, so both verify during the overlap window (`DEVPLATFORM_WEBHOOK_SECRET_OVERLAP_MINUTES`, default
+one, so both verify during the overlap window (`DEVPLATFORM_WEBHOOK_ROTATION_OVERLAP_MINUTES`, default
 24 h) and a customer can deploy and roll back. A single-value rotation would require the subscriber
 to change configuration in the same instant this service does, and that instant does not exist.
 

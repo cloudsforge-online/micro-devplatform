@@ -161,7 +161,7 @@ export interface Env {
   readonly defaultQuotaPerMonth: number
 
   /** How long a rotated webhook secret keeps verifying. */
-  readonly webhookSecretOverlapMinutes: number
+  readonly webhookRotationOverlapMinutes: number
   /** Deadline on one webhook POST. A slow subscriber must not hold the delivery lease open. */
   readonly webhookDeadlineMs: number
   /** Attempts before a delivery is abandoned and left for an operator to see. */
@@ -210,7 +210,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     defaultQuotaPerMinute: integer(source, 'DEVPLATFORM_DEFAULT_QUOTA_PER_MINUTE', 600, 1, 10_000_000),
     defaultQuotaPerMonth: integer(source, 'DEVPLATFORM_DEFAULT_QUOTA_PER_MONTH', 1_000_000, 1, 10_000_000_000),
 
-    webhookSecretOverlapMinutes: integer(source, 'DEVPLATFORM_WEBHOOK_SECRET_OVERLAP_MINUTES', 1_440, 1, 43_200),
+    webhookRotationOverlapMinutes: integer(source, 'DEVPLATFORM_WEBHOOK_ROTATION_OVERLAP_MINUTES', 1_440, 1, 43_200),
     webhookDeadlineMs: integer(source, 'DEVPLATFORM_WEBHOOK_DEADLINE_MS', 5_000, 100, 60_000),
     webhookMaxAttempts: integer(source, 'DEVPLATFORM_WEBHOOK_MAX_ATTEMPTS', 8, 1, 50),
 

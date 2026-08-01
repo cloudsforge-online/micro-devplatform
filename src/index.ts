@@ -119,7 +119,7 @@ const server = createServer({
   ingestSecrets: env.ingestSecrets,
   defaultQuotaPerMinute: env.defaultQuotaPerMinute,
   defaultQuotaPerMonth: env.defaultQuotaPerMonth,
-  webhookSecretOverlapMinutes: env.webhookSecretOverlapMinutes,
+  webhookRotationOverlapMinutes: env.webhookRotationOverlapMinutes,
   // Gauges are sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository and CI greps for one — rule 8.
   beforeScrape: async () => {

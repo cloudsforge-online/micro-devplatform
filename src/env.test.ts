@@ -202,7 +202,7 @@ test('the defaults are the ones the README and .env.example state', () => {
   const env = loadEnv(base())
   assert.equal(env.defaultQuotaPerMinute, 600)
   assert.equal(env.defaultQuotaPerMonth, 1_000_000)
-  assert.equal(env.webhookSecretOverlapMinutes, 1_440)
+  assert.equal(env.webhookRotationOverlapMinutes, 1_440)
   assert.equal(env.webhookMaxAttempts, 8)
   assert.equal(env.usageEventRetentionDays, 35)
   assert.equal(env.usageRollupRetentionDays, 400)
@@ -236,7 +236,7 @@ test('.env.example declares every variable this service reads, with no real secr
 
   // And nothing in it is a working secret. Every secret slot is a placeholder that does not boot.
   // Matched on the variable NAME ending in _SECRET/_SECRETS rather than on the line containing the
-  // word: `DEVPLATFORM_WEBHOOK_SECRET_OVERLAP_MINUTES` is a duration, and a check that demanded a
+  // word: `DEVPLATFORM_WEBHOOK_ROTATION_OVERLAP_MINUTES` is a duration, and a check that demanded a
   // placeholder there would be a check somebody deletes.
   let checked = 0
   for (const line of example.split('\n')) {
