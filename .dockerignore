@@ -1,0 +1,14 @@
+# Secret hygiene first. `.git` carries every secret that was ever committed and then
+# removed; `.env` and `.env.*` carry the ones that were never meant to be committed at
+# all. A COPY . . with any of these present bakes them into a layer that ships.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+*.tsbuildinfo
+.github
+README.md
