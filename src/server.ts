@@ -1631,9 +1631,16 @@ function requireEnvironment(body: Record<string, unknown>): KeyEnvironment {
  *
  * **The routes that predate it do not, and that is a defect, reported rather than changed.**
  * `GET /v1/projects/not-a-uuid` is a 500 today (`authoriseProject` → `findProject`), as are the
- * key, endpoint and client reads. Changing the status code of eleven shipped routes is a different
+ * key, endpoint and client reads. Changing the status code of the shipped routes is a different
  * decision from the four this change is about, and `micro-devportal-web` pins citations into every
  * one of them.
+ *
+ * THE COUNT IS NOT WRITTEN DOWN HERE, deliberately. It said "eleven"; a re-count found nineteen
+ * routes carrying an `:id`, and a third reading reported twenty-five. A number in a comment that
+ * three readers disagree about is worse than no number, because work gets scoped against it. Count
+ * it when you need it, and the command is the honest form of the claim:
+ *
+ *     grep -oE "'/v1/[^']*:id[^']*'" src/server.ts | sort -u | wc -l
  */
 function requireUuid(value: string, what: string): string {
   if (!UUID.test(value)) throw new BadRequestError(`${what} must be a uuid`)
