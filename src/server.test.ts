@@ -31,12 +31,14 @@ import { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
 import type { Principal } from '@cloudsforge/auth'
 import {
+  ADMIN_SCOPE,
   INTROSPECT_SCOPE,
   createServer,
   registerServiceMetrics,
   type PrincipalVerifier,
   type ServerDeps,
 } from './server.ts'
+import { MAX_UNITS_CEILING } from './quotas.ts'
 import { signEvent, type Db } from './outbox.ts'
 import { parseKey } from './keys.ts'
 import { MembershipUnavailableError, type MembershipClient, type OrgRole } from './membership.ts'
@@ -193,6 +195,29 @@ test('the server', { skip }, async (t) => {
     return token
   }
 
+  /**
+   * The two principals `isOperator` admits, and one that looks like an operator and is not.
+   *
+   * A platform operator is deliberately NOT a member of the customer's organisation — no
+   * `membership.grant` here — because that is the property under test: an operator asked to be a
+   * member of every organisation they act on would end up holding a credential that is a member of
+   * all of them, which is the shape SD-05 exists to retire.
+   */
+  function operatorService(): string {
+    return serviceToken([ADMIN_SCOPE])
+  }
+
+  function operatorUser(): string {
+    const token = `operator-token-${uniqueSlug('op')}`
+    verifier.setPrincipal(token, {
+      kind: 'user',
+      userId: `user_${uniqueSlug('op')}`,
+      handle: 'operator',
+      roles: ['admin'],
+    })
+    return token
+  }
+
   /* ---------------------------------------------------------------- health */
 
   await t.test('/livez is static and needs no credential', async () => {
@@ -312,6 +337,10 @@ test('the server', { skip }, async (t) => {
       ['GET', `/v1/projects/${project.id}/oauth-clients`, token],
       ['GET', `/v1/projects/${project.id}/application`, token],
       ['GET', '/v1/keys/self', secretKey],
+      // The two reads added with the operator surface. Walked here for the same reason as the rest:
+      // a route added tomorrow that returns a secret through an unexpected field fails this test.
+      ['GET', `/v1/organisations?identityOrgId=${encodeURIComponent(org.identityOrgId)}`, token],
+      ['GET', '/v1/apps/pending', operatorService()],
     ]
 
     let checked = 0
@@ -331,7 +360,7 @@ test('the server', { skip }, async (t) => {
         )
       }
     }
-    assert.ok(checked >= 16, `only ${checked} read routes were walked`)
+    assert.ok(checked >= 18, `only ${checked} read routes were walked`)
   })
 
   await t.test('AN IDEMPOTENT RETRY REPLAYS, AND THE REPLAY CARRIES NO SECRET', async () => {
@@ -617,8 +646,12 @@ test('the server', { skip }, async (t) => {
     // `seedWorkspace` calls `createProject` directly, which does NOT seed default quotas — only
     // `POST /v1/projects` does, and that is deliberate: the quota rows and the project are one
     // transaction at the route. So set the quota through its own route, which exercises it too.
+    //
+    // With an OPERATOR token, because creating a quota where none exists is an operator decision:
+    // an environment with no row is unlimited, and a customer allowed to create the first one could
+    // create it at any value and call it a reduction. See the route's own header.
     const set = await call('PUT', `/v1/projects/${project.id}/quotas`, {
-      token,
+      token: operatorService(),
       body: { environment: 'live', period: 'minute', maxUnits: 2 },
     })
     assert.equal(set.status, 200)
@@ -644,7 +677,7 @@ test('the server', { skip }, async (t) => {
     const issued = await issueKeyOverHttp(project, token)
     const keyId = (issued.json['key'] as Record<string, unknown>)['id'] as string
     await call('PUT', `/v1/projects/${project.id}/quotas`, {
-      token,
+      token: operatorService(),
       body: { environment: 'live', period: 'minute', maxUnits: 5 },
     })
 
@@ -812,11 +845,431 @@ test('the server', { skip }, async (t) => {
     await call('POST', `/v1/projects/${project.id}/application/submit`, { token })
     assert.equal((await call('GET', `/v1/apps/${slug}`)).status, 404)
 
-    // Only the operator transition does.
-    await sql`update applications set status = 'listed', listed_at = now() where project_id = ${project.id}`
+    // Only the operator transition does — through the ROUTE. This case used to reach `listed` with
+    // a hand-written UPDATE, which is how it passed for months while `setApplicationStatus` was
+    // imported by the server and called by nothing: the test wrote the row the route could not.
+    const decided = await call('PUT', `/v1/projects/${project.id}/application/status`, {
+      token: operatorService(),
+      body: { status: 'listed' },
+    })
+    assert.equal(decided.status, 200)
     const listed = await call('GET', `/v1/apps/${slug}`)
     assert.equal(listed.status, 200)
     assert.ok((await call('GET', '/v1/apps')).body.includes(slug))
+  })
+
+  await t.test('THE DEVELOPER WHO SUBMITTED IT CANNOT APPROVE IT', async () => {
+    // A directory a developer can publish to unilaterally is a directory that eventually hosts a
+    // phishing page wearing this platform's chrome — and the consent screen a user reads before
+    // granting an OAuth client authority is rendered from exactly this row.
+    const { project, token } = await scenario('owner')
+    const slug = uniqueSlug('app')
+    await call('PUT', `/v1/projects/${project.id}/application`, { token, body: { slug, name: 'My App' } })
+    await call('POST', `/v1/projects/${project.id}/application/submit`, { token })
+
+    const refused = await call('PUT', `/v1/projects/${project.id}/application/status`, {
+      token,
+      body: { status: 'listed' },
+    })
+    assert.equal(refused.status, 403, 'the project owner listed their own application')
+    assert.match(String(JSON.stringify(refused.json)), /devplatform:admin or role:admin/)
+    assert.equal((await call('GET', `/v1/apps/${slug}`)).status, 404)
+
+    // Nor can an API key in the project, at any scope — `devplatform:admin` is not in the
+    // vocabulary `validateScopes` will issue, so no key can hold it.
+    const key = await issueKeyOverHttp(project, token, { scopes: ['devplatform:write'] })
+    const byKey = await call('PUT', `/v1/projects/${project.id}/application/status`, {
+      token: key.json['secretKey'] as string,
+      body: { status: 'listed' },
+    })
+    assert.equal(byKey.status, 403)
+  })
+
+  await t.test('a platform admin\'s USER token is an operator, without any membership', async () => {
+    // The other principal `isOperator` admits. No `membership.grant` for this user anywhere: an
+    // operator who had to be a member of every organisation would end up holding a credential that
+    // is a member of all of them.
+    const { project, token } = await scenario()
+    const slug = uniqueSlug('app')
+    await call('PUT', `/v1/projects/${project.id}/application`, { token, body: { slug, name: 'My App' } })
+    await call('POST', `/v1/projects/${project.id}/application/submit`, { token })
+
+    const decided = await call('PUT', `/v1/projects/${project.id}/application/status`, {
+      token: operatorUser(),
+      body: { status: 'listed' },
+    })
+    assert.equal(decided.status, 200)
+    assert.equal((await call('GET', `/v1/apps/${slug}`)).status, 200)
+  })
+
+  await t.test('an operator may reject, and a rejection is not a delisting', async () => {
+    const { project, token } = await scenario()
+    const slug = uniqueSlug('app')
+    await call('PUT', `/v1/projects/${project.id}/application`, { token, body: { slug, name: 'My App' } })
+    await call('POST', `/v1/projects/${project.id}/application/submit`, { token })
+
+    const rejected = await call('PUT', `/v1/projects/${project.id}/application/status`, {
+      token: operatorService(),
+      body: { status: 'rejected' },
+    })
+    assert.equal(rejected.status, 200)
+    assert.equal((rejected.json['application'] as Record<string, unknown>)['status'], 'rejected')
+
+    // The developer can see the decision on their own listing, and it is not 'delisted'.
+    const mine = await call('GET', `/v1/projects/${project.id}/application`, { token })
+    assert.equal((mine.json['application'] as Record<string, unknown>)['status'], 'rejected')
+
+    // And it is not public, by either address.
+    assert.equal((await call('GET', `/v1/apps/${slug}`)).status, 404)
+    assert.ok(!(await call('GET', '/v1/apps')).body.includes(slug))
+  })
+
+  await t.test('an illegal transition is a 409 and a developer-owned status is a 400', async () => {
+    const { project, token } = await scenario()
+    const slug = uniqueSlug('app')
+    await call('PUT', `/v1/projects/${project.id}/application`, { token, body: { slug, name: 'My App' } })
+    const operator = operatorService()
+
+    // A draft has never been submitted. Listing it publishes copy nobody reviewed.
+    const early = await call('PUT', `/v1/projects/${project.id}/application/status`, {
+      token: operator,
+      body: { status: 'listed' },
+    })
+    assert.equal(early.status, 409)
+    assert.equal((early.json['error'] as Record<string, unknown>)['code'], 'conflict')
+
+    // `in_review` is the developer's transition, not an operator's.
+    const wrong = await call('PUT', `/v1/projects/${project.id}/application/status`, {
+      token: operator,
+      body: { status: 'in_review' },
+    })
+    assert.equal(wrong.status, 400)
+    assert.match(String(JSON.stringify(wrong.json)), /listed, rejected, delisted/)
+
+    // And a project id that is not a uuid is a 400 rather than a 500 carrying 22P02.
+    const malformed = await call('PUT', '/v1/projects/not-a-uuid/application/status', {
+      token: operator,
+      body: { status: 'listed' },
+    })
+    assert.equal(malformed.status, 400)
+  })
+
+  await t.test('THE REVIEW QUEUE IS THE OPERATOR\'S, AND NOBODY ELSE\'S', async () => {
+    // Without it the approval route is unaddressable: it is keyed by project id, an operator is not
+    // a member of the project's organisation, and `GET /v1/apps` shows only what is already listed.
+    const { project, token } = await scenario()
+    const slug = uniqueSlug('app')
+    await call('PUT', `/v1/projects/${project.id}/application`, { token, body: { slug, name: 'My App' } })
+    await call('POST', `/v1/projects/${project.id}/application/submit`, { token })
+
+    for (const [label, options] of [
+      ['anonymous', {}],
+      ['the developer who submitted it', { token }],
+      ['a service token with no operator scope', { token: serviceToken([INTROSPECT_SCOPE]) }],
+    ] as const) {
+      const refused = await call('GET', '/v1/apps/pending', options)
+      assert.ok(refused.status === 401 || refused.status === 403, `${label} read the review queue`)
+      assert.ok(!refused.body.includes(slug), `${label} was shown an unlisted application`)
+    }
+
+    for (const operator of [operatorService(), operatorUser()]) {
+      const queue = await call('GET', '/v1/apps/pending', { token: operator })
+      assert.equal(queue.status, 200)
+      const applications = queue.json['applications'] as Array<Record<string, unknown>>
+      assert.deepEqual(
+        applications.map((application) => application['slug']),
+        [slug],
+      )
+    }
+  })
+
+  await t.test('the review queue does not shadow a listing, because that slug cannot exist', async () => {
+    // `/v1/apps/pending` is matched before `/v1/apps/:slug`. The ordering is not what makes this
+    // safe — `applications_slug_not_reserved` is.
+    const { project, token } = await scenario()
+    const taken = await call('PUT', `/v1/projects/${project.id}/application`, {
+      token,
+      body: { slug: 'pending', name: 'Shadow' },
+    })
+    assert.equal(taken.status, 400)
+    assert.match(String(JSON.stringify(taken.json)), /reserved/)
+  })
+
+  /* ---------------------------------------------------------------- quotas over http */
+
+  /** A project created through its own route, so it has the default quota rows a customer has. */
+  async function projectWithDefaultQuotas() {
+    const { org, token, userId } = await scenario()
+    const created = await call('POST', '/v1/projects', {
+      token,
+      idempotencyKey: `proj-${uniqueSlug('q')}`,
+      body: { orgId: org.id, name: 'Checkout', slug: uniqueSlug('checkout') },
+    })
+    assert.equal(created.status, 201)
+    return { org, token, userId, project: created.json['project'] as Record<string, unknown> }
+  }
+
+  await t.test('A CUSTOMER CANNOT RAISE THEIR OWN QUOTA', async () => {
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // The defect this whole change exists for. The route required only `project:write` and
+    // `setQuota` accepted any whole number ≥ 1 with no ceiling, so the OWNER of a project could
+    // set their own rate limit to whatever they liked. A quota the quota'd party can raise is not
+    // a quota, and `micro-devportal-web` declined to call this route at all for that reason.
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    const { project, token } = await projectWithDefaultQuotas()
+    const id = project['id'] as string
+
+    const raised = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token,
+      body: { environment: 'live', period: 'minute', maxUnits: 1_000_000 },
+    })
+    assert.equal(raised.status, 403, 'a project owner raised their own rate limit')
+    assert.match(String(JSON.stringify(raised.json)), /never raise it/)
+
+    // And the row did not move.
+    const quotas = await call('GET', `/v1/projects/${id}/quotas`, { token })
+    const minute = (quotas.json['quotas'] as Array<Record<string, unknown>>).find(
+      (quota) => quota['period'] === 'minute',
+    )
+    assert.equal(minute?.['maxUnits'], 600, 'the refused raise was written anyway')
+  })
+
+  await t.test('a customer CAN lower their own quota, and hold it', async () => {
+    // Lowering is a safety feature: a developer capping their test environment so a runaway loop
+    // cannot burn the month's allowance is doing the platform's work for it. Making that need an
+    // operator would mean nobody ever does it.
+    const { project, token } = await projectWithDefaultQuotas()
+    const id = project['id'] as string
+
+    const lowered = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token,
+      body: { environment: 'live', period: 'minute', maxUnits: 60 },
+    })
+    assert.equal(lowered.status, 200)
+    assert.equal((lowered.json['quota'] as Record<string, unknown>)['maxUnits'], 60)
+
+    // Equal is permitted, deliberately: PUT is idempotent by natural key and a retry that 403'd
+    // would make the exemption in `routeidempotency.test.ts` a lie.
+    const retried = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token,
+      body: { environment: 'live', period: 'minute', maxUnits: 60 },
+    })
+    assert.equal(retried.status, 200, 'an identical retry of a PUT was refused')
+
+    // But it cannot go back up, not even to where it started.
+    const back = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token,
+      body: { environment: 'live', period: 'minute', maxUnits: 600 },
+    })
+    assert.equal(back.status, 403)
+  })
+
+  await t.test('a customer cannot CREATE a quota, because a missing row is unlimited', async () => {
+    // `quotasFor` returns nothing for an environment with no row and `consumeAll` over an empty
+    // list allows everything. Treating absence as infinity and calling any finite value a
+    // reduction would hand the whole defect back through the periods that have no row.
+    const { project, token } = await projectWithDefaultQuotas()
+    const id = project['id'] as string
+    const answer = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token,
+      body: { environment: 'live', period: 'day', maxUnits: 10_000_000 },
+    })
+    assert.equal(answer.status, 403)
+    assert.match(String(JSON.stringify(answer.json)), /no day quota/)
+  })
+
+  await t.test('AN API KEY WITH devplatform:write CANNOT RAISE ITS OWN PROJECT\'S QUOTA', async () => {
+    // Worse than the owner case and the one the original finding did not name: a MACHINE credential
+    // inside the project could raise the limit that binds it. `devplatform:admin` is absent from
+    // `scopes.ts`, so no key can ever hold the authority that would let it.
+    const { project, token } = await projectWithDefaultQuotas()
+    const id = project['id'] as string
+    const issued = await call('POST', `/v1/projects/${id}/keys`, {
+      token,
+      idempotencyKey: `k-${uniqueSlug('qk')}`,
+      body: { environment: 'live', name: 'agent', scopes: ['devplatform:write'] },
+    })
+    const secretKey = issued.json['secretKey'] as string
+
+    // It may lower — it holds `project:write` and that is what lowering needs.
+    assert.equal(
+      (
+        await call('PUT', `/v1/projects/${id}/quotas`, {
+          token: secretKey,
+          body: { environment: 'live', period: 'minute', maxUnits: 10 },
+        })
+      ).status,
+      200,
+    )
+    // It may not raise, and asking for the scope that would let it is refused at issuance.
+    const raised = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token: secretKey,
+      body: { environment: 'live', period: 'minute', maxUnits: 11 },
+    })
+    assert.equal(raised.status, 403)
+
+    const forbidden = await call('POST', `/v1/projects/${id}/keys`, {
+      token,
+      idempotencyKey: `k-${uniqueSlug('qa')}`,
+      body: { environment: 'live', name: 'escalation', scopes: ['devplatform:admin'] },
+    })
+    assert.equal(forbidden.status, 400, 'devplatform:admin was issued to an api key')
+    assert.equal((forbidden.json['error'] as Record<string, unknown>)['code'], 'unknown_scope')
+  })
+
+  await t.test('an operator may raise it, and needs no membership to do so', async () => {
+    const { project, token } = await projectWithDefaultQuotas()
+    const id = project['id'] as string
+
+    for (const operator of [operatorService(), operatorUser()]) {
+      const raised = await call('PUT', `/v1/projects/${id}/quotas`, {
+        token: operator,
+        body: { environment: 'live', period: 'minute', maxUnits: 5_000 },
+      })
+      assert.equal(raised.status, 200)
+      assert.equal((raised.json['quota'] as Record<string, unknown>)['maxUnits'], 5_000)
+    }
+    // The customer can still see it, and still cannot move it upward.
+    const quotas = await call('GET', `/v1/projects/${id}/quotas`, { token })
+    assert.match(quotas.body, /5000/)
+  })
+
+  await t.test('NOT EVEN AN OPERATOR MAY EXCEED THE CEILING IN THE SCHEMA', async () => {
+    // The bound is `quotas_max_within_ceiling`, and it holds against a caller with a database
+    // connection — which this handler is not. Refused here as a 400 naming the number rather than
+    // reaching the constraint and returning a 500 carrying 23514.
+    const { project } = await projectWithDefaultQuotas()
+    const id = project['id'] as string
+    const operator = operatorService()
+
+    const over = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token: operator,
+      body: { environment: 'live', period: 'minute', maxUnits: MAX_UNITS_CEILING.minute + 1 },
+    })
+    assert.equal(over.status, 400, `a minute quota of ${MAX_UNITS_CEILING.minute + 1} was accepted`)
+    assert.equal((over.json['error'] as Record<string, unknown>)['code'], 'invalid')
+    assert.match(String(JSON.stringify(over.json)), new RegExp(String(MAX_UNITS_CEILING.minute)))
+
+    // The ceiling itself is legal, so this is a bound rather than a blanket refusal, and the reply
+    // says what it is so a console can render the range rather than guess it.
+    const at = await call('PUT', `/v1/projects/${id}/quotas`, {
+      token: operator,
+      body: { environment: 'live', period: 'minute', maxUnits: MAX_UNITS_CEILING.minute },
+    })
+    assert.equal(at.status, 200)
+    assert.equal(at.json['ceiling'], MAX_UNITS_CEILING.minute)
+  })
+
+  await t.test('a service token with no operator scope reaches neither half of the route', async () => {
+    // It is not a member of anything, so there is no `project:write` path open to it either.
+    const { project } = await projectWithDefaultQuotas()
+    const answer = await call('PUT', `/v1/projects/${project['id'] as string}/quotas`, {
+      token: serviceToken([INTROSPECT_SCOPE]),
+      body: { environment: 'live', period: 'minute', maxUnits: 1 },
+    })
+    assert.equal(answer.status, 403)
+  })
+
+  await t.test('an operator still gets a 404 for a project that does not exist', async () => {
+    const answer = await call('PUT', `/v1/projects/${crypto.randomUUID()}/quotas`, {
+      token: operatorService(),
+      body: { environment: 'live', period: 'minute', maxUnits: 10 },
+    })
+    assert.equal(answer.status, 404)
+  })
+
+  /* ---------------------------------------------------------------- resolving an organisation */
+
+  await t.test('GET /v1/organisations resolves an enrolment without a mutation', async () => {
+    // Before this route the only way to answer "which developer organisation am I in?" was to
+    // re-POST the idempotent enrolment and read what came back — a write issued to ask a question.
+    const { org, token } = await scenario()
+    const answer = await call(
+      'GET',
+      `/v1/organisations?identityOrgId=${encodeURIComponent(org.identityOrgId)}`,
+      { token },
+    )
+    assert.equal(answer.status, 200)
+    const organisations = answer.json['organisations'] as Array<Record<string, unknown>>
+    assert.equal(organisations.length, 1)
+    assert.equal(organisations[0]?.['id'], org.id)
+    assert.equal(organisations[0]?.['identityOrgId'], org.identityOrgId)
+  })
+
+  await t.test('IT CANNOT BE USED TO ENUMERATE ANOTHER CUSTOMER\'S ORGANISATION', async () => {
+    // Authority is asked of identity with the caller's own token BEFORE the row is read, and a
+    // non-member gets the same 404 identity itself gives for "not a member, or no such
+    // organisation". Resolving that ambiguity would make devplatform an oracle for organisations
+    // identity deliberately hides.
+    const mine = await scenario()
+    const theirs = await scenario()
+    const answer = await call(
+      'GET',
+      `/v1/organisations?identityOrgId=${encodeURIComponent(theirs.org.identityOrgId)}`,
+      { token: mine.token },
+    )
+    assert.equal(answer.status, 404)
+    assert.ok(!answer.body.includes(theirs.org.id), 'a non-member was shown the organisation id')
+
+    // An organisation that does not exist at all answers identically.
+    const unknown = await call('GET', '/v1/organisations?identityOrgId=org_does_not_exist', {
+      token: mine.token,
+    })
+    assert.equal(unknown.status, 404)
+    assert.equal(
+      JSON.stringify(unknown.json).replace(/"requestId":"[^"]*"/, ''),
+      JSON.stringify(answer.json).replace(/"requestId":"[^"]*"/, ''),
+      'a caller can tell "not a member" from "no such organisation"',
+    )
+  })
+
+  await t.test('a member of an unenrolled organisation gets an empty list, not a 404', async () => {
+    // The difference matters to a console: "you are in this company but it has no developer
+    // platform presence yet" is an enrolment button, whereas a 404 is a dead end. It leaks
+    // nothing — identity has already confirmed the caller is a member.
+    const token = `user-token-${uniqueSlug('t')}`
+    const userId = `user_${uniqueSlug('u')}`
+    verifier.setPrincipal(token, { kind: 'user', userId, handle: 'dev', roles: [] })
+    membership.grant(userId, 'org_never_enrolled', 'owner')
+
+    const answer = await call('GET', '/v1/organisations?identityOrgId=org_never_enrolled', { token })
+    assert.equal(answer.status, 200)
+    assert.deepEqual(answer.json['organisations'], [])
+  })
+
+  await t.test('the resolve route refuses a key, a service token and a missing parameter', async () => {
+    const { org, project, token } = await scenario()
+    const query = `?identityOrgId=${encodeURIComponent(org.identityOrgId)}`
+
+    assert.equal((await call('GET', `/v1/organisations${query}`)).status, 401)
+    assert.equal(
+      (await call('GET', `/v1/organisations${query}`, { token: serviceToken(['devplatform:read']) })).status,
+      403,
+    )
+    const issued = await issueKeyOverHttp(project, token, { scopes: ['devplatform:read'] })
+    assert.equal(
+      (await call('GET', `/v1/organisations${query}`, { token: issued.json['secretKey'] as string })).status,
+      403,
+      'an api key resolved an organisation it has no membership in',
+    )
+    const bare = await call('GET', '/v1/organisations', { token })
+    assert.equal(bare.status, 400, 'the route listed every organisation it holds')
+    assert.match(String(JSON.stringify(bare.json)), /identityOrgId is required/)
+  })
+
+  await t.test('identity being unreachable is a 503 here too, never a 404', async () => {
+    const { org, token } = await scenario()
+    membership.unavailable(true)
+    try {
+      const answer = await call(
+        'GET',
+        `/v1/organisations?identityOrgId=${encodeURIComponent(org.identityOrgId)}`,
+        { token },
+      )
+      assert.equal(answer.status, 503)
+    } finally {
+      membership.unavailable(false)
+    }
   })
 
   /* ---------------------------------------------------------------- webhooks over http */
@@ -875,6 +1328,86 @@ test('the server', { skip }, async (t) => {
       select count(*)::int as n from webhook_secrets where endpoint_id = ${endpointId}
     `
     assert.equal(rows[0]?.n, 2, 'a retried rotation minted a third secret')
+  })
+
+  await t.test('A DISABLED ENDPOINT CAN BE RE-ENABLED, AND KEEPS ITS SECRET', async () => {
+    // `/disable` passed `true` unconditionally and there was no inverse, so disabling was
+    // permanent: the only way back was to DELETE the endpoint and create a new one, which mints a
+    // new signing secret, drops the delivery history and requires the subscriber to redeploy. An
+    // endpoint is disabled DURING an incident, which is the worst hour to be told to rotate.
+    const { project, token } = await scenario()
+    const created = await call('POST', `/v1/projects/${project.id}/webhook-endpoints`, {
+      token,
+      idempotencyKey: `wh-${uniqueSlug('en')}`,
+      body: { environment: 'live', url: 'https://subscriber.example.com/hook', topics: ['devplatform.key.issued'] },
+    })
+    const endpointId = (created.json['endpoint'] as Record<string, unknown>)['id'] as string
+    const secretBefore = await sql<{ secret: string }[]>`
+      select secret from webhook_secrets where endpoint_id = ${endpointId}
+    `
+
+    const disabled = await call('POST', `/v1/webhook-endpoints/${endpointId}/disable`, { token })
+    assert.equal(disabled.status, 200)
+    assert.ok((disabled.json['endpoint'] as Record<string, unknown>)['disabledAt'])
+
+    const enabled = await call('POST', `/v1/webhook-endpoints/${endpointId}/enable`, { token })
+    assert.equal(enabled.status, 200)
+    assert.equal((enabled.json['endpoint'] as Record<string, unknown>)['disabledAt'], null)
+
+    // The same signing secret, so the subscriber never had to redeploy.
+    const secretAfter = await sql<{ secret: string }[]>`
+      select secret from webhook_secrets where endpoint_id = ${endpointId}
+    `
+    assert.equal(secretAfter.length, 1)
+    assert.equal(secretAfter[0]?.secret, secretBefore[0]?.secret)
+    // And no route ever showed it again.
+    assert.ok(!disabled.body.includes(secretBefore[0]!.secret))
+    assert.ok(!enabled.body.includes(secretBefore[0]!.secret))
+
+    // Idempotent: the second enable writes the same value and creates no second artefact.
+    const again = await call('POST', `/v1/webhook-endpoints/${endpointId}/enable`, { token })
+    assert.equal(again.status, 200)
+    assert.equal((again.json['endpoint'] as Record<string, unknown>)['disabledAt'], null)
+  })
+
+  await t.test('enabling an endpoint needs project:write, and another customer cannot', async () => {
+    const { project, token } = await scenario()
+    const created = await call('POST', `/v1/projects/${project.id}/webhook-endpoints`, {
+      token,
+      idempotencyKey: `wh-${uniqueSlug('ep')}`,
+      body: { environment: 'live', url: 'https://subscriber.example.com/hook', topics: ['devplatform.key.issued'] },
+    })
+    const endpointId = (created.json['endpoint'] as Record<string, unknown>)['id'] as string
+    await call('POST', `/v1/webhook-endpoints/${endpointId}/disable`, { token })
+
+    // A member may read but not write, so a member may not put a customer's integration back on.
+    const reader = await scenario('member')
+    assert.equal(
+      (await call('POST', `/v1/webhook-endpoints/${endpointId}/enable`, { token: reader.token })).status,
+      404,
+      'a member of ANOTHER organisation re-enabled this endpoint',
+    )
+    // A read-scoped key in the right project is a 403 rather than a 404 — it can see the project.
+    const readKey = await issueKeyOverHttp(project, token, { scopes: ['devplatform:read'] })
+    assert.equal(
+      (
+        await call('POST', `/v1/webhook-endpoints/${endpointId}/enable`, {
+          token: readKey.json['secretKey'] as string,
+        })
+      ).status,
+      403,
+    )
+    assert.equal((await call('POST', `/v1/webhook-endpoints/${endpointId}/enable`)).status, 401)
+
+    // Still disabled after all of that.
+    const endpoints = await call('GET', `/v1/projects/${project.id}/webhook-endpoints`, { token })
+    const endpoint = (endpoints.json['endpoints'] as Array<Record<string, unknown>>)[0]
+    assert.ok(endpoint?.['disabledAt'], 'a refused enable took effect anyway')
+
+    assert.equal(
+      (await call('POST', `/v1/webhook-endpoints/${crypto.randomUUID()}/enable`, { token })).status,
+      404,
+    )
   })
 
   await t.test('a plaintext or inward-pointing webhook url is refused', async () => {

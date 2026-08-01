@@ -54,6 +54,27 @@ export function isPeriod(value: string): value is Period {
 /** The only meter today. A column rather than a constant so a second meter is a row, not a migration. */
 export const API_REQUESTS = 'api_requests'
 
+/**
+ * The largest a quota may be, per period. **The same numbers are a CHECK — migration 9.**
+ *
+ * They are declared here as well so that a caller gets a 400 naming the ceiling rather than a 500
+ * carrying 23514, and they are declared in the SCHEMA so that the bound survives a write path that
+ * never comes through this function. `migrations.test.ts` fires the constraint and
+ * `quotas.test.ts` asserts the two layers agree on the same number, which is the only thing that
+ * stops them drifting apart.
+ *
+ * The values are not a judgement about what a plan should be. Each is the largest value this
+ * service's own configuration already permits to be seeded into these rows (`env.ts:210` for a
+ * minute window, `env.ts:211` for every longer one), so a legal configuration can never be refused
+ * by the constraint guarding the rows it seeds.
+ */
+export const MAX_UNITS_CEILING: Readonly<Record<Period, number>> = Object.freeze({
+  minute: 10_000_000,
+  hour: 10_000_000_000,
+  day: 10_000_000_000,
+  month: 10_000_000_000,
+})
+
 export interface Quota {
   readonly id: string
   readonly projectId: string
@@ -125,6 +146,14 @@ export async function setQuota(
     // status on the organisation, not a limit on a meter.
     throw new ValidationError('maxUnits must be a whole number of at least 1; a quota of zero is a suspension, not a limit')
   }
+  const ceiling = MAX_UNITS_CEILING[input.period]
+  if (input.maxUnits > ceiling) {
+    // The database refuses this too — `quotas_max_within_ceiling`, migration 9. Refused here as
+    // well so the caller gets a 400 naming the number rather than a 500 carrying 23514.
+    throw new ValidationError(
+      `maxUnits for a ${input.period} quota may not exceed ${ceiling}; a limit above that is not a limit`,
+    )
+  }
   const rows = await sql<QuotaRow[]>`
     insert into quotas (project_id, environment_id, meter, period, max_units)
     values (${input.projectId}, ${input.environmentId}, ${input.meter ?? API_REQUESTS}, ${input.period}, ${input.maxUnits})
@@ -135,6 +164,29 @@ export async function setQuota(
   const row = rows[0]
   if (!row) throw new Error('quota upsert returned no row')
   return toQuota(row)
+}
+
+/**
+ * One quota, by its natural key, or null.
+ *
+ * The read `PUT /v1/projects/:id/quotas` makes before it decides whether the request is a RAISE.
+ * It is a separate function from `quotasFor` because the comparison has to be against exactly the
+ * row the upsert is about to overwrite — one period, one meter — and a caller that filtered a list
+ * would eventually filter it wrong.
+ */
+export async function findQuota(
+  sql: Tx | Db,
+  environmentId: string,
+  period: Period,
+  meter: string = API_REQUESTS,
+): Promise<Quota | null> {
+  const rows = await sql<QuotaRow[]>`
+    select id, project_id, environment_id, meter, period, max_units
+      from quotas
+     where environment_id = ${environmentId} and meter = ${meter} and period = ${period}
+  `
+  const row = rows[0]
+  return row ? toQuota(row) : null
 }
 
 export async function listQuotas(sql: Tx | Db, projectId: string): Promise<readonly Quota[]> {

@@ -46,6 +46,12 @@ const EXEMPT: Readonly<Record<string, string>> = {
     'a state transition claimed with `where status in (...)`; the second attempt matches no row',
   'POST /v1/webhook-endpoints/:id/disable':
     'a state transition writing a fixed value; the second attempt writes the same value',
+  'POST /v1/webhook-endpoints/:id/enable':
+    'the inverse of /disable, and the same mechanism: a state transition writing a fixed value ' +
+    '(disabled_at = null), so the second attempt writes the same value',
+  'PUT /v1/projects/:id/application/status':
+    'a state transition claimed with `where status = any(...)` from OPERATOR_TRANSITIONS; the ' +
+    'second attempt matches no row and answers 409 rather than deciding the application twice',
   'DELETE /v1/keys/:id':
     'DELETE is idempotent by definition, and revokeApiKey claims with `where revoked_at is null` so ' +
     'the first revocation\'s time and reason survive',
@@ -192,7 +198,26 @@ test('the server never selects a stored secret column', () => {
 test('no route reads a stored webhook secret back to a caller', () => {
   // `liveSecrets` and `signingSecret` exist for the delivery job. If either appears inside a route
   // handler, a customer can read a secret they were shown once — which is the whole property.
-  const routeBlock = SERVER.slice(SERVER.indexOf('function buildRoutes'), SERVER.indexOf('/* ----'))
+  //
+  // ── THIS CHECK WAS VACUOUS, AND IS THE THIRD OF ITS KIND FOUND IN THIS ESTATE. ────────────────
+  //
+  // It ended the slice at `SERVER.indexOf('/* ----')`, which finds the FIRST such banner in the
+  // file — the `plumbing` one, ~15 kB BEFORE `function buildRoutes`. A backwards slice in
+  // JavaScript is the empty string, so this searched nothing and could never fail, for either
+  // name, however a route was written. Exactly the failure `micro-trade-web`'s hardcoded line
+  // numbers produced: a guard that cannot fail is worse than none, because it is counted.
+  //
+  // Fixed by naming the banner that CLOSES the route list rather than the first one that matches a
+  // prefix, and by asserting the extractor found the block at all — a length assertion is what
+  // stops the next version going quiet the same way.
+  const start = SERVER.indexOf('function buildRoutes')
+  const end = SERVER.indexOf('------ helpers */', start)
+  assert.ok(start >= 0 && end > start, 'the route block could not be located in server.ts')
+  const routeBlock = SERVER.slice(start, end)
+  assert.ok(
+    routeBlock.length > 10_000 && routeBlock.includes("define('GET', '/v1/scopes'"),
+    `the route block extractor found ${routeBlock.length} characters and no route list`,
+  )
   for (const forbidden of ['liveSecrets', 'signingSecret']) {
     assert.ok(!routeBlock.includes(forbidden), `a route calls ${forbidden}`)
   }

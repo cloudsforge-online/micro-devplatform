@@ -46,9 +46,33 @@
  *             `devplatform:read` / `devplatform:write` scope. A key can therefore rotate its
  *             siblings but can never reach another customer's project, because the project id is
  *             taken from the ROW, never from the request.
- *   SERVICE   An identity-issued service JWT, on `/internal` only — which
+ *   SERVICE   An identity-issued service JWT. On `/internal` — which
  *             `deploy/gateway/dynamic/policy.yml` refuses from outside at a priority nothing can
- *             outrank.
+ *             outrank — and on the four OPERATOR routes, where it must carry `devplatform:admin`.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **AN OPERATOR IS NOT A MEMBER OF THE CUSTOMER'S ORGANISATION, AND MUST NOT HAVE TO BE.**
+ *
+ * Four things on this surface are the PLATFORM's decision about a customer rather than the
+ * customer's decision about themselves: raising a quota, listing an application, rejecting one, and
+ * reading the review queue. `isOperator` admits two principals for them and no third —
+ *
+ *   a SERVICE token carrying the exact scope `devplatform:admin`, or
+ *   a USER token carrying the platform role `admin` (`runtime/packages/auth`'s `Role`, :24).
+ *
+ * — which is `market/src/server.ts:1335-1342`'s `requireOperator`, adopted rather than reinvented.
+ * **An API key is never an operator**, whatever it carries: `devplatform:admin` is deliberately
+ * absent from `scopes.ts`, so `validateScopes` refuses it at issuance and a key cannot hold it.
+ *
+ * This does not contradict the rule three paragraphs up. That rule refuses a service token that
+ * names no scope, on routes that decide a customer's credentials by membership; these routes check
+ * an EXACT scope with `includes`, which is the same control `/internal/keys/verify` uses and for
+ * the same reason — `runtime/packages/auth`'s `hasScope` would admit `devplatform:*`.
+ *
+ * The membership check is SKIPPED for an operator rather than added to, and that is the point: an
+ * operator asked to be a member of every organisation they ever act on would either be added to
+ * thousands of them or given a token that is a member of all of them, and the second is the shape
+ * of the omnipotent credential SD-05 exists to retire.
  *
  * **EVERY REFUSAL OF A CREDENTIAL IS THE SAME 401 WITH THE SAME MESSAGE.** `authenticateKey`
  * returns a reason — `unknown`, `revoked`, `expired`, `org_suspended` — and it goes to the log and
@@ -114,9 +138,11 @@ import { SCOPES, SCOPE_NAMES, UnknownScopeError, grantsScope, type Scope } from 
 import { isKeyEnvironment, type Kdf, type KeyEnvironment, type ScryptParams } from './keys.ts'
 import {
   API_REQUESTS,
+  MAX_UNITS_CEILING,
   consumeAll,
   currentUsage,
   emitQuotaExceeded,
+  findQuota,
   isPeriod,
   listQuotas,
   listUsage,
@@ -143,9 +169,11 @@ import {
   verifyClientSecret,
 } from './oauth.ts'
 import {
+  OPERATOR_STATUSES,
   findApplicationByProject,
   findListedApplication,
   listDirectory,
+  listForReview,
   setApplicationStatus,
   submitForReview,
   upsertApplication,
@@ -170,6 +198,19 @@ export const WRITE_SCOPE: Scope = 'devplatform:write'
 
 /** The service scope an internal caller needs to introspect a credential. */
 export const INTROSPECT_SCOPE = 'devplatform:introspect'
+
+/**
+ * The service scope that makes a caller a platform OPERATOR.
+ *
+ * Deliberately absent from `scopes.ts`: that file is the vocabulary a customer's API key may carry,
+ * `validateScopes` refuses anything outside it at issuance, and a key that could raise its own
+ * project's quota would be the defect this scope exists to close. Matched with `includes`, never
+ * with `hasScope` — see the file header.
+ */
+export const ADMIN_SCOPE = 'devplatform:admin'
+
+/** The platform role on a USER token that makes its holder an operator. `runtime/packages/auth`:24. */
+export const ADMIN_ROLE = 'admin'
 
 export const ORG_DELETED_TOPIC = 'identity.organisation.deleted'
 export const USER_DELETED_TOPIC = 'identity.user.deleted'
@@ -424,6 +465,14 @@ interface UserPrincipal {
   readonly userId: string
   /** The raw token, kept so it can be forwarded to identity's membership route. Never logged. */
   readonly token: string
+  /**
+   * Platform roles from the token, verbatim. `admin` is the estate's operator.
+   *
+   * Carried rather than discarded because this is the ONLY thing that distinguishes a platform
+   * operator from any other developer on the console surface: there is no operator table here, and
+   * a service that invented one would be answering a question identity owns.
+   */
+  readonly roles: readonly string[]
 }
 
 interface KeyPrincipal {
@@ -432,17 +481,31 @@ interface KeyPrincipal {
   readonly orgId: string
 }
 
+interface ServicePrincipal {
+  readonly kind: 'service'
+  readonly service: string
+  readonly scopes: readonly string[]
+}
+
+/** The two principals the customer surface admits. A service token is not one of them. */
 type CallerPrincipal = UserPrincipal | KeyPrincipal
 
+/** Everything that can present a credential, including the operator's service token. */
+type AnyPrincipal = CallerPrincipal | ServicePrincipal
+
 /**
- * Resolve the caller.
+ * Resolve whoever is calling, service tokens included.
  *
  * A `cfk_` string is tried FIRST, by prefix, and that ordering is not an optimisation: handing a
  * key to `Verifier.principal` would dial the JWKS endpoint for a string that is provably not a JWT,
  * so a burst of malformed keys would become a burst of outbound requests to identity — an
  * amplification an unauthenticated caller controls the rate of.
+ *
+ * This is the only function that reads the Authorization header for a route, so a route resolves
+ * its caller ONCE. `authenticate` narrows it for the customer surface; the operator routes keep the
+ * wider type and ask `isOperator`.
  */
-async function authenticate(ctx: RequestContext, deps: ServerDeps): Promise<CallerPrincipal> {
+async function authenticateAny(ctx: RequestContext, deps: ServerDeps): Promise<AnyPrincipal> {
   const token = bearerFrom(headerOf(ctx.req, 'authorization'))
   if (!token) throw new UnauthenticatedError('missing')
 
@@ -459,13 +522,43 @@ async function authenticate(ctx: RequestContext, deps: ServerDeps): Promise<Call
   }
 
   const principal = await deps.verifier.principal(token)
-  if (principal.kind !== 'user') {
-    // A service token is not "close enough" on the developer surface. It names no user, so there is
-    // no membership to check, and accepting one here would make every service in the estate an
-    // administrator of every customer's credentials.
-    throw new ForbiddenError('this route requires a user token')
+  if (principal.kind === 'service') {
+    return { kind: 'service', service: principal.service, scopes: principal.scopes }
   }
-  return { kind: 'user', userId: principal.userId, token }
+  return { kind: 'user', userId: principal.userId, token, roles: principal.roles }
+}
+
+/**
+ * Resolve the caller on the CUSTOMER surface.
+ *
+ * A service token is not "close enough" here. It names no user, so there is no membership to check,
+ * and accepting one would make every service in the estate an administrator of every customer's
+ * credentials. The operator routes are the exception and they say so, by requiring an exact scope
+ * rather than by relaxing this.
+ */
+async function authenticate(ctx: RequestContext, deps: ServerDeps): Promise<CallerPrincipal> {
+  const caller = await authenticateAny(ctx, deps)
+  if (caller.kind === 'service') throw new ForbiddenError('this route requires a user token')
+  return caller
+}
+
+/**
+ * Is this the platform, acting on a customer?
+ *
+ * **An API key is never an operator.** Not "does not usually carry the scope" — `devplatform:admin`
+ * is not in `scopes.ts`, so `validateScopes` refuses it at issuance and no row can hold it. That is
+ * the property that stops the whole quota defect coming back through a different door: a key that
+ * could make itself an operator could still raise its own project's limit.
+ */
+function isOperator(caller: AnyPrincipal): boolean {
+  if (caller.kind === 'service') return caller.scopes.includes(ADMIN_SCOPE)
+  if (caller.kind === 'user') return caller.roles.includes(ADMIN_ROLE)
+  return false
+}
+
+/** `market/src/server.ts:1335`'s shape: the scope or the role, and nothing else. */
+function requireOperator(caller: AnyPrincipal): void {
+  if (!isOperator(caller)) throw new ForbiddenError(`${ADMIN_SCOPE} or role:admin`)
 }
 
 /** A user token only. The console surface. */
@@ -513,7 +606,22 @@ async function authoriseProject(
   projectId: string,
   need: 'read' | 'write',
 ): Promise<{ caller: CallerPrincipal; project: Project }> {
-  const caller = await authenticate(ctx, deps)
+  return authoriseProjectAs(await authenticate(ctx, deps), deps, projectId, need)
+}
+
+/**
+ * The same decision, for a route that has already resolved its caller.
+ *
+ * Split out for `PUT /v1/projects/:id/quotas`, which has to know whether the caller is an operator
+ * BEFORE it knows which authorisation to apply, and must not verify the token twice to find out.
+ * The body is unchanged; `authoriseProject` is now the two-line wrapper it always was.
+ */
+async function authoriseProjectAs(
+  caller: CallerPrincipal,
+  deps: ServerDeps,
+  projectId: string,
+  need: 'read' | 'write',
+): Promise<{ caller: CallerPrincipal; project: Project }> {
   const project = await findProject(deps.sql, projectId)
   // 404 rather than 403 for a project the caller cannot see. A 403 confirms the id exists, which
   // makes project ids enumerable across customers.
@@ -650,6 +758,42 @@ function buildRoutes(): Route[] {
         slug: requireString(body, 'slug'),
       })
       return { status: 201, body: { organisation: org } }
+    }),
+
+    /**
+     * Resolve an identity organisation to its developer-platform enrolment.
+     *
+     * **The read that stops a console using a mutation as a query.** Before this route the only way
+     * to answer "which developer organisation am I in?" was to re-POST `/v1/organisations` and read
+     * what came back — idempotent, and therefore harmless, and still a write issued to ask a
+     * question. A console that has to mutate to read is one keystroke away from mutating when it
+     * meant to read.
+     *
+     * **It cannot enumerate.** The lookup key is the IDENTITY organisation id, which the caller has
+     * to already hold, and authority is asked of identity with the caller's own token before the
+     * row is read at all — so this route answers nothing that `authoriseOrg` would not, and a
+     * non-member gets the same 404 for "you are not a member" and "there is no such organisation"
+     * that identity itself gives. Preserving that ambiguity is the point: resolving it would turn
+     * devplatform into an oracle for organisations identity deliberately hides.
+     *
+     * A MEMBER of an organisation that has never been enrolled gets `200 { organisations: [] }`
+     * rather than a 404, and the difference matters to the console: "you are in this company but it
+     * has no developer platform presence yet" is an enrolment button, whereas a 404 is a dead end.
+     * It leaks nothing — identity has already confirmed the caller is a member.
+     */
+    define('GET', '/v1/organisations', async (ctx, deps) => {
+      const caller = await authenticateUser(ctx, deps)
+      const identityOrgId = (ctx.url.searchParams.get('identityOrgId') ?? '').trim()
+      if (identityOrgId === '') {
+        throw new BadRequestError(
+          'identityOrgId is required: this route resolves ONE identity organisation to its ' +
+            'enrolment. There is no listing, because this service holds no membership rows to list from',
+        )
+      }
+      const role = await deps.membership.roleFor(caller.token, identityOrgId, caller.userId)
+      if (!permits(role, READ_ROLES)) throw new NotFoundError('no such developer organisation')
+      const org = await findOrgByIdentityId(deps.sql, identityOrgId)
+      return { status: 200, body: { organisations: org ? [org] : [] } }
     }),
 
     define('GET', '/v1/organisations/:id', async (ctx, deps) => {
@@ -832,9 +976,40 @@ function buildRoutes(): Route[] {
     /**
      * Set a quota. PUT, and idempotent by natural key — the upsert is on
      * `(environment_id, meter, period)`, so a retry writes the same row.
+     *
+     * ════════════════════════════════════════════════════════════════════════════════════════
+     * **A QUOTA THE QUOTA'D PARTY CAN RAISE IS NOT A QUOTA.**
+     *
+     * This route used to require only `project:write` and pass any whole number ≥ 1 to `setQuota`,
+     * which had no ceiling — so the owner of a project, and equally any API KEY in it carrying
+     * `devplatform:write`, could set their own rate limit to whatever they liked. That is not a
+     * limit with a weak check on it; it is a limit whose value is chosen by the party it binds.
+     * `micro-devportal-web` declined to call this route at all for exactly that reason, which is
+     * why the developer console has no quota editor.
+     *
+     * **THE DIRECTION IS THE AUTHORITY.** Lowering is a customer's own safety feature — a
+     * developer capping their test environment so a runaway loop cannot burn their month's
+     * allowance is doing the platform's work for it, and making that need an operator would mean
+     * nobody ever does it. Raising is the abuse. So:
+     *
+     *   LOWER or HOLD   `project:write`, exactly as before. Equal is permitted deliberately: PUT
+     *                   is idempotent by natural key and a retry that 403'd would make the
+     *                   exemption in `routeidempotency.test.ts` a lie.
+     *   RAISE           an operator. `isOperator` — a service token carrying `devplatform:admin`,
+     *                   or a user with the platform role `admin`.
+     *   CREATE          an operator. A missing row is UNLIMITED, not "zero": `quotasFor` returns
+     *                   nothing and `consumeAll` over an empty list allows everything. Treating
+     *                   absence as infinity and calling any finite value a reduction would hand
+     *                   back the whole defect through the environments that have no row.
+     *
+     * **AND THE VALUE IS BOUNDED IN THE SCHEMA.** `quotas_max_within_ceiling` (migration 9) refuses
+     * a per-minute quota above 10,000,000 and anything else above 10,000,000,000, whatever write
+     * path produced it. The check here is the authority; the CHECK is the bound, and it holds
+     * against a caller with a database connection, which this handler does not.
+     * ════════════════════════════════════════════════════════════════════════════════════════
      */
     define('PUT', '/v1/projects/:id/quotas', async (ctx, deps) => {
-      const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'write')
+      const caller = await authenticateAny(ctx, deps)
       const body = await readJson(ctx.req)
       const environment = requireEnvironment(body)
       const period = requireString(body, 'period')
@@ -842,15 +1017,47 @@ function buildRoutes(): Route[] {
       const maxUnits = body['maxUnits']
       if (typeof maxUnits !== 'number') throw new BadRequestError('maxUnits must be a number')
 
+      const operator = isOperator(caller)
+      let project: Project
+      if (operator) {
+        // No membership check. An operator setting a customer's limit is the platform acting on
+        // the customer, and requiring membership would mean joining every organisation to do it.
+        const found = await findProject(deps.sql, requireUuid(ctx.params['id'] ?? '', 'project id'))
+        if (!found) throw new NotFoundError('no such project')
+        project = found
+      } else if (caller.kind === 'service') {
+        // A service token with no operator scope. Not "close enough" — see the file header.
+        throw new ForbiddenError(`${ADMIN_SCOPE} or role:admin`)
+      } else {
+        ;({ project } = await authoriseProjectAs(caller, deps, ctx.params['id'] ?? '', 'write'))
+      }
+
       const target = await findEnvironment(deps.sql, project.id, environment)
       if (!target) throw new NotFoundError('no such project environment')
+
+      if (!operator) {
+        const current = await findQuota(deps.sql, target.id, period)
+        if (!current) {
+          throw new ForbiddenError(
+            `${ADMIN_SCOPE} or role:admin — this environment has no ${period} quota, and creating ` +
+              'one is an operator decision. A project:write caller may only lower a limit that exists',
+          )
+        }
+        if (maxUnits > current.maxUnits) {
+          throw new ForbiddenError(
+            `${ADMIN_SCOPE} or role:admin — a project:write caller may lower a quota (currently ` +
+              `${current.maxUnits} per ${period}) but never raise it`,
+          )
+        }
+      }
+
       const quota = await setQuota(deps.sql, {
         projectId: project.id,
         environmentId: target.id,
         period,
         maxUnits,
       })
-      return { status: 200, body: { quota } }
+      return { status: 200, body: { quota, ceiling: MAX_UNITS_CEILING[period] } }
     }),
 
     define('GET', '/v1/projects/:id/quotas', async (ctx, deps) => {
@@ -934,6 +1141,16 @@ function buildRoutes(): Route[] {
       return { ...reply, body: { ...(reply.body as Record<string, unknown>), secret } }
     }),
 
+    /**
+     * Disable an endpoint. Deliveries stop; the endpoint, its secrets and its history survive.
+     *
+     * The pair with `/enable` below. Disabling used to be the only half that existed — this handler
+     * passed `true` unconditionally and there was no inverse — so the only way back was to DELETE
+     * the endpoint and create a new one, which mints a new signing secret, drops the delivery
+     * history and requires the subscriber to redeploy. An endpoint is disabled DURING an incident,
+     * which is precisely the hour in which "you must now rotate your webhook secret" is the worst
+     * possible answer.
+     */
     define('POST', '/v1/webhook-endpoints/:id/disable', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
       const endpoint = await findEndpoint(deps.sql, id)
@@ -942,6 +1159,30 @@ function buildRoutes(): Route[] {
       // A state transition claimed on a column; the second attempt writes the same value. There is
       // no second artefact a retry could create.
       return { status: 200, body: { endpoint: await setEndpointDisabled(deps.sql, id, true) } }
+    }),
+
+    /**
+     * Re-enable it. `disabled_at` back to null, and the endpoint resumes receiving.
+     *
+     * A separate route rather than a `{ disabled: boolean }` body on one, because the two are not
+     * equally consequential and a boolean makes them look it: one stops a customer's integration
+     * and the other starts it, and a client that inverted the flag would silently do the opposite
+     * of what its operator intended. Two verbs cannot be inverted.
+     *
+     * Deliveries enqueued while it was disabled are NOT replayed — `enqueueDeliveries` selects
+     * `where e.disabled_at is null` (`webhooks.ts:380`), so nothing was queued. That is stated
+     * because the
+     * opposite is the reasonable assumption, and an operator who assumed it would wait for a flood
+     * that never comes.
+     */
+    define('POST', '/v1/webhook-endpoints/:id/enable', async (ctx, deps) => {
+      const id = ctx.params['id'] ?? ''
+      const endpoint = await findEndpoint(deps.sql, id)
+      if (!endpoint) throw new NotFoundError('no such webhook endpoint')
+      await authoriseProject(ctx, deps, endpoint.projectId, 'write')
+      // Same shape as `/disable`: a state transition writing a fixed value, so the second attempt
+      // writes the same value and creates no second artefact.
+      return { status: 200, body: { endpoint: await setEndpointDisabled(deps.sql, id, false) } }
     }),
 
     define('DELETE', '/v1/webhook-endpoints/:id', async (ctx, deps) => {
@@ -1024,6 +1265,29 @@ function buildRoutes(): Route[] {
       body: { applications: await listDirectory(deps.sql, { limit: clampLimit(ctx.url.searchParams.get('limit'), 100, 500) }) },
     })),
 
+    /**
+     * The review queue. Operator only.
+     *
+     * **Declared BEFORE `/v1/apps/:slug`, and the shadowing is impossible rather than remembered.**
+     * The router takes the first route whose pattern matches (`createServer`, above), so a literal
+     * segment has to precede the parameterised one — an ordering somebody will eventually undo
+     * while tidying. `applications_slug_not_reserved` (migration 9) refuses `pending` as a slug at
+     * the database, so there is no listing this route can shadow even if it is moved.
+     *
+     * It exists because the approval route below is otherwise unaddressable: it is keyed by project
+     * id, an operator is not a member of the project's organisation and so cannot read it through
+     * `GET /v1/projects/:id/application`, and `GET /v1/apps` shows only what is already listed. An
+     * approval route nobody can find the subject of is a route nothing calls, which is the defect
+     * this whole change exists to remove.
+     */
+    define('GET', '/v1/apps/pending', async (ctx, deps) => {
+      requireOperator(await authenticateAny(ctx, deps))
+      const applications = await listForReview(deps.sql, {
+        limit: clampLimit(ctx.url.searchParams.get('limit'), 100, 500),
+      })
+      return { status: 200, body: { applications } }
+    }),
+
     define('GET', '/v1/apps/:slug', async (ctx, deps) => {
       const application = await findListedApplication(deps.sql, ctx.params['slug'] ?? '')
       if (!application) throw new NotFoundError('no such application')
@@ -1056,6 +1320,38 @@ function buildRoutes(): Route[] {
     define('POST', '/v1/projects/:id/application/submit', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'write')
       return { status: 200, body: { application: await submitForReview(deps.sql, project.id) } }
+    }),
+
+    /**
+     * The decision. Operator only — the transition that completes the lifecycle.
+     *
+     * `setApplicationStatus` was written on the first day and **called by nothing**: it was
+     * imported by this file and never referenced, so a developer could submit a listing and no
+     * caller in the estate could approve one. The directory route existed, the submit route
+     * existed, and the only path from `in_review` to `listed` was a hand-written UPDATE — which is
+     * how `server.test.ts` proved the directory worked, and why nobody noticed.
+     *
+     * Not `project:write`, at any strength. A directory a developer can publish to unilaterally is
+     * a directory that eventually hosts a phishing page wearing this platform's chrome, and the
+     * consent screen a user reads before granting an OAuth client authority is rendered from
+     * exactly this row.
+     *
+     * The legal transitions are `applications.ts`'s, claimed in the UPDATE: a status that is not an
+     * operator's to set is a 400, and a status that is theirs but unreachable from where the row
+     * currently is, is a 409 naming both. `rejected` is one of them, and it is a different fact
+     * from `delisted` — see that file's header.
+     */
+    define('PUT', '/v1/projects/:id/application/status', async (ctx, deps) => {
+      requireOperator(await authenticateAny(ctx, deps))
+      const body = await readJson(ctx.req)
+      const status = requireString(body, 'status')
+      if (!isApplicationStatus(status) || !OPERATOR_STATUSES.includes(status)) {
+        throw new BadRequestError(`status must be one of ${OPERATOR_STATUSES.join(', ')}`)
+      }
+      const projectId = requireUuid(ctx.params['id'] ?? '', 'project id')
+      const application = await setApplicationStatus(deps.sql, projectId, status)
+      ctx.log.info('an application status was decided', { projectId, status })
+      return { status: 200, body: { application } }
     }),
 
     /* ---------------------------------------------------------------- internal */
@@ -1323,6 +1619,24 @@ function requireEnvironment(body: Record<string, unknown>): KeyEnvironment {
   if (typeof value !== 'string' || !isKeyEnvironment(value)) {
     throw new BadRequestError("environment must be 'live' or 'test'")
   }
+  return value
+}
+
+/**
+ * A path segment that is about to be compared against a `uuid` column.
+ *
+ * Postgres answers `22P02 invalid input syntax for type uuid` for a segment that is not one, which
+ * arrives here as an unhandled failure and leaves as a 500 — a malformed URL reported as a server
+ * fault. The two operator routes added with this change use it.
+ *
+ * **The routes that predate it do not, and that is a defect, reported rather than changed.**
+ * `GET /v1/projects/not-a-uuid` is a 500 today (`authoriseProject` → `findProject`), as are the
+ * key, endpoint and client reads. Changing the status code of eleven shipped routes is a different
+ * decision from the four this change is about, and `micro-devportal-web` pins citations into every
+ * one of them.
+ */
+function requireUuid(value: string, what: string): string {
+  if (!UUID.test(value)) throw new BadRequestError(`${what} must be a uuid`)
   return value
 }
 

@@ -23,9 +23,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   API_REQUESTS,
+  MAX_UNITS_CEILING,
   consumeAll,
   consumeQuota,
   currentUsage,
+  findQuota,
   listQuotas,
   listUsage,
   quotasFor,
@@ -241,6 +243,54 @@ test('quotas', { skip }, async (t) => {
         `maxUnits=${maxUnits} was accepted`,
       )
     }
+  })
+
+  await t.test('A QUOTA ABOVE ITS CEILING IS REFUSED BEFORE IT REACHES THE DATABASE', async () => {
+    // The database refuses it too — `quotas_max_within_ceiling`, proven in `migrations.test.ts`.
+    // Here, so that a caller gets a 400 naming the number rather than a 500 carrying 23514.
+    const { projectId, environmentId } = await workspaceWithQuota(1)
+    for (const period of ['minute', 'hour', 'day', 'month'] as const) {
+      const ceiling = MAX_UNITS_CEILING[period]
+      await assert.rejects(
+        () => setQuota(store, { projectId, environmentId, period, maxUnits: ceiling + 1 }),
+        (err: unknown) => err instanceof ValidationError && String(err).includes(String(ceiling)),
+        `a ${period} quota of ${ceiling + 1} was accepted`,
+      )
+      // The ceiling itself is legal, so this is a bound rather than a blanket refusal.
+      const accepted = await setQuota(store, {
+        projectId,
+        environmentId,
+        meter: `ceiling_${period}`,
+        period,
+        maxUnits: ceiling,
+      })
+      assert.equal(accepted.maxUnits, ceiling)
+    }
+  })
+
+  await t.test('A PER-MINUTE CEILING IS LOWER THAN A PER-MONTH ONE', async () => {
+    // Not decoration: one ceiling for every period would have to be the month's, and a per-minute
+    // allowance of ten billion is not a limit anybody chose — it is a number nobody bounded.
+    assert.ok(
+      MAX_UNITS_CEILING.minute < MAX_UNITS_CEILING.month,
+      'the minute and month ceilings are the same, so the shorter window is effectively unbounded',
+    )
+  })
+
+  await t.test('findQuota reads exactly one row, by its natural key', async () => {
+    // The read `PUT /v1/projects/:id/quotas` makes to decide whether a request is a RAISE. A
+    // comparison against the wrong row is a comparison that lets a raise through.
+    const { projectId, environmentId } = await workspaceWithQuota(10)
+    await setQuota(store, { projectId, environmentId, period: 'month', maxUnits: 500 })
+
+    assert.equal((await findQuota(store, environmentId, 'minute'))?.maxUnits, 10)
+    assert.equal((await findQuota(store, environmentId, 'month'))?.maxUnits, 500)
+    assert.equal(await findQuota(store, environmentId, 'day'), null, 'a period with no row is null')
+    assert.equal(
+      await findQuota(store, environmentId, 'minute', 'webhook_deliveries'),
+      null,
+      'a second meter on the same period is a different quota',
+    )
   })
 
   await t.test('currentUsage reports the live window for every period', async () => {

@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { BASELINE_VERSION, MIGRATIONS, SCHEMA_VERSION, TABLES } from './migrations.ts'
 import { CURRENT_ALGO } from './keys.ts'
+import { MAX_UNITS_CEILING } from './quotas.ts'
 import { migrateTestDb, openDb, resetDevplatform, seedWorkspace, skip } from './testsupport.ts'
 
 /* ------------------------------------------------------------------ the file itself */
@@ -269,6 +270,58 @@ test('the schema', { skip }, async (t) => {
     )
   })
 
+  await t.test('A QUOTA ABOVE ITS CEILING IS REFUSED BY THE DATABASE, PER PERIOD', async () => {
+    // The top half of the bound `quotas_max_positive` only ever guarded the bottom of. Before
+    // migration 9 nothing refused ten billion requests a minute, so the only thing between a
+    // customer and an unlimited plan was one line in a handler — and a CHECK holds against a
+    // caller with a database connection, which a handler does not.
+    const { project } = await seedWorkspace(sql)
+    const environments = await sql<{ id: string }[]>`
+      select id from environments where project_id = ${project.id} limit 1
+    `
+    const environmentId = environments[0]!.id
+    const insert = (period: string, maxUnits: number) => sql`
+      insert into quotas (project_id, environment_id, meter, period, max_units)
+      values (${project.id}, ${environmentId}, ${`api_requests_${period}_${maxUnits}`}, ${period}, ${maxUnits})
+    `
+
+    for (const [period, over] of [
+      ['minute', MAX_UNITS_CEILING.minute + 1],
+      ['hour', MAX_UNITS_CEILING.hour + 1],
+      ['day', MAX_UNITS_CEILING.day + 1],
+      ['month', MAX_UNITS_CEILING.month + 1],
+    ] as const) {
+      await assert.rejects(
+        () => insert(period, over),
+        (err: unknown) => String(err).includes('quotas_max_within_ceiling'),
+        `the database accepted a ${period} quota of ${over}`,
+      )
+    }
+
+    // And it is not merely refusing everything: the ceiling itself is a legal value, which is what
+    // makes `env.ts`'s own maximum configurable default seedable rather than a boot failure.
+    for (const period of ['minute', 'hour', 'day', 'month'] as const) {
+      await insert(period, MAX_UNITS_CEILING[period])
+    }
+  })
+
+  await t.test('the ceiling in the schema and the ceiling in quotas.ts are the same number', async () => {
+    // Two layers, one number. They drift the day somebody raises one and forgets the other, and the
+    // symptom of the drift is a 500 carrying 23514 where a 400 naming the ceiling belongs.
+    const rows = await sql<{ definition: string }[]>`
+      select pg_get_constraintdef(oid) as definition
+        from pg_constraint where conname = 'quotas_max_within_ceiling'
+    `
+    const definition = rows[0]?.definition ?? ''
+    assert.ok(definition.length > 0, 'quotas_max_within_ceiling is not on the table')
+    for (const value of new Set(Object.values(MAX_UNITS_CEILING))) {
+      assert.ok(
+        definition.includes(String(value)),
+        `MAX_UNITS_CEILING names ${value} and the constraint does not: ${definition}`,
+      )
+    }
+  })
+
   /* ---------------------------------------------------------------- webhooks and oauth */
 
   await t.test('a plaintext webhook url is refused', async () => {
@@ -355,6 +408,38 @@ test('the schema', { skip }, async (t) => {
       `,
       (err: unknown) => String(err).includes('applications_listed_has_time'),
     )
+  })
+
+  await t.test("'rejected' is a status the database knows, and 'refused' is not", async () => {
+    // A rejected application and a delisted one are different facts about a developer. Before
+    // migration 9 there was nowhere to record the first, so it was written as the second.
+    const { project } = await seedWorkspace(sql)
+    await sql`
+      insert into applications (project_id, slug, name, status)
+      values (${project.id}, 'my-app', 'My App', 'rejected')
+    `
+    await assert.rejects(
+      () => sql`
+        update applications set status = 'refused' where project_id = ${project.id}
+      `,
+      (err: unknown) => String(err).includes('applications_status_known'),
+      'the status vocabulary is open',
+    )
+  })
+
+  await t.test('a listing may not take the slug an operator route already serves', async () => {
+    // `/v1/apps/pending` is matched before `/v1/apps/:slug`, so a listing called `pending` could
+    // never be fetched at its own public address. The collision is unrepresentable rather than
+    // documented: an ordering that has to be preserved by hand is one that will be reordered.
+    const { project } = await seedWorkspace(sql)
+    await assert.rejects(
+      () => sql`
+        insert into applications (project_id, slug, name) values (${project.id}, 'pending', 'My App')
+      `,
+      (err: unknown) => String(err).includes('applications_slug_not_reserved'),
+    )
+    // Every other legal slug still passes, so the constraint is not refusing the shape.
+    await sql`insert into applications (project_id, slug, name) values (${project.id}, 'pending-app', 'My App')`
   })
 
   /* ---------------------------------------------------------------- cascades */

@@ -249,7 +249,7 @@ after the response is written.
 
 This is enforced by two independent tests, because they fail on different mistakes:
 
-- `server.test.ts` walks **all 16 read routes** and greps every response body for each of the four
+- `server.test.ts` walks **all 18 read routes** and greps every response body for each of the four
   minted secrets. Catches a leak through an unexpected field.
 - `routeidempotency.test.ts` enumerates the four **source positions** where a secret may be attached
   at all, and asserts each is assigned from a mint rather than from a query. Catches a route added
@@ -317,6 +317,140 @@ tempting implementation: a read-then-write increment allows 22 of 40, differentl
 than retroactively to the one in progress. That also makes "what was the limit when this request was
 refused?" answerable after the fact.
 
+#### A quota the quota'd party can raise is not a quota
+
+`PUT /v1/projects/:id/quotas` (`src/server.ts:1011`) used to require only `project:write`, and
+`setQuota` accepted any whole number ≥ 1 with **no upper bound** — `quotas_max_positive` guarded the
+bottom and nothing guarded the top. So the owner of a project could set their own rate limit to
+whatever they liked, and so could any **API key** in it carrying `devplatform:write`: a machine
+credential raising the limit that binds it. `micro-devportal-web` declined to call this route at all
+for that reason, which is why the developer console still has no quota editor.
+
+**The direction is the authority.** Lowering is a customer's own safety feature — a developer capping
+their test environment so a runaway loop cannot burn the month's allowance is doing the platform's
+work for it, and making that need an operator means nobody ever does it. Raising is the abuse.
+
+| Request | Who | Where |
+| --- | --- | --- |
+| lower, or write the same value again | `project:write` | `src/server.ts:1039-1052` |
+| raise | operator | `src/server.ts:1046-1051` |
+| create a row where none exists | operator | `src/server.ts:1040-1045` |
+| any value above the ceiling | **nobody** | `src/quotas.ts:149-156`, `src/migrations.ts:524-526` |
+
+Equal is permitted deliberately: PUT is idempotent by natural key, and a retry that answered 403
+would make that route's exemption in `routeidempotency.test.ts` a lie.
+
+**Creating a quota is an operator act, and that is not an oversight.** An environment with *no* row
+is unlimited — `quotasFor` returns nothing and `consumeAll` over an empty list allows everything
+(`src/quotas.ts:319-327` and `src/quotas.ts:310-315`). Treating absence as infinity and calling any finite value a reduction
+would hand the whole defect back through the periods that have no row.
+
+**The ceiling is in the schema**, `quotas_max_within_ceiling` (`src/migrations.ts:524-526`), and it is
+there rather than in the handler for the reason this estate always gives: a CHECK holds against a
+caller with a database connection — a backfill, a psql session, a write path written next year — and
+a handler does not. The same numbers are in `MAX_UNITS_CEILING` (`src/quotas.ts:71-76`) so a caller
+gets a 400 naming the ceiling instead of a 500 carrying `23514`, and `migrations.test.ts` reads
+`pg_get_constraintdef` and asserts the two agree, which is the only thing that stops them drifting.
+
+They are not a judgement about what a plan should be. Each is the largest value this service's own
+configuration already permits to be *seeded* into these rows — `env.ts:210` bounds
+`DEVPLATFORM_DEFAULT_QUOTA_PER_MINUTE` at 10,000,000 and `env.ts:211` bounds
+`DEVPLATFORM_DEFAULT_QUOTA_PER_MONTH` at 10,000,000,000 — so a legal configuration can never be
+refused by the constraint guarding the rows it seeds. The minute ceiling is the lower of the two on
+purpose: one ceiling for every period would have to be the month's, and a per-minute allowance of ten
+billion is not a limit anybody chose.
+
+**Nothing is silently migrated, and no stored quota is above it.** Adding the constraint *validates
+every existing row*: a database holding one fails migration 9 with `23514`, and the deploy stops. That
+is the intended behaviour rather than a hazard — a migration that quietly clamped somebody's limit
+would destroy the only record of what it had been, and the repair is a deliberate `UPDATE` decided
+by a person before the deploy.
+
+Checked rather than assumed. Migration 9 was run against three databases already at version 8 and
+carrying rows:
+
+| Version-8 database | Result |
+| --- | --- |
+| default quotas (600/minute, 1,000,000/month) and a delisted listing | applied |
+| a `minute` quota of 99,999,999,999 | refused: `quotas_max_within_ceiling … is violated by some row` |
+| a listing whose slug is `pending` | refused: `applications_slug_not_reserved … is violated by some row` |
+
+No production database is in either failing state, because **this service has never been deployed**:
+it is routed in `deploy/gateway/dynamic/public-api.yml:177` and appears in no file under
+`deploy/compose/`, so the only `quotas` rows that have ever existed are the ones CI creates and
+drops. Every value any code path could have written is inside the ceiling anyway — `env.ts:210-211`
+bound the seeded defaults and `PUT /v1/projects/:id/quotas` was the only other writer.
+
+**An operator here is not an administrator of the customer's organisation.** `isOperator`
+(`src/server.ts:553-557`) admits a service token carrying the exact scope `devplatform:admin`, or a
+user token carrying the platform role `admin` — `market/src/server.ts:1335-1341`'s `requireOperator`,
+adopted rather than reinvented. The membership check is *skipped* for them rather than added to,
+because an operator asked to be a member of every organisation they act on ends up holding a
+credential that is a member of all of them, which is the shape SD-05 exists to retire. An **API key
+is never an operator**: `devplatform:admin` is deliberately absent from `src/scopes.ts`, so
+`validateScopes` refuses it at issuance and no row can hold it.
+
+### The application directory has an operator, and it now has a route
+
+`setApplicationStatus` (`src/applications.ts:238`) was written on the first day, imported by the
+server, and **called by no handler at all**. An application could be submitted and could never be
+approved, so the directory could never be populated. `server.test.ts` proved the directory worked by
+writing `update applications set status = 'listed'` by hand — a test that writes the row itself
+cannot notice that nothing else can — and `applications.ts` had no test file of its own until now.
+
+`PUT /v1/projects/:id/application/status` (`src/server.ts:1344`) is that handler, and it is an
+operator's. Not `project:write` at any strength: a directory a developer can publish to unilaterally
+is a directory that eventually hosts a phishing page wearing this platform's chrome, and the consent
+screen a user reads before granting an OAuth client authority is rendered from exactly this row.
+
+**The transitions are enumerated and the move is claimed, not assigned.** `OPERATOR_TRANSITIONS`
+(`src/applications.ts:80-87`) names the legal sources for each target and the UPDATE claims with
+`where status = any(...)` (`src/applications.ts:255`), so two operators deciding one submission
+produce one winner and one 409 rather than two successes and a last-write-wins — including `listed`
+silently overwriting a `rejected` somebody had just decided. The unguarded version also made
+`draft → listed` reachable, which publishes copy nobody reviewed.
+
+**`rejected` is a status of its own** (migration 9), not a reuse of `delisted`. "We looked and said
+no" and "you were live and we took you down" are different facts about a developer, support answers
+them differently, and one is a resubmission while the other is an appeal. `submitForReview` accepts
+`rejected` as a source (`src/applications.ts:211`) so a rejected listing can be revised and asked
+about again — one operator's "no" is not permanent.
+
+The queue an operator works from is `GET /v1/apps/pending` (`src/server.ts:1283`), oldest first,
+because newest-first ordering on a queue nobody empties starves the developer who has waited longest.
+It is matched **before** `GET /v1/apps/:slug` (`src/server.ts:1291`), and what makes that safe is not
+the ordering: `applications_slug_not_reserved` (`src/migrations.ts:548-549`) refuses `pending` as a
+slug, so there is no listing this route can shadow even if somebody reorders the file.
+
+### A disabled webhook endpoint can be turned back on
+
+`POST /v1/webhook-endpoints/:id/disable` passed `true` unconditionally and there was no inverse, so
+disabling was permanent. The only way back was to `DELETE` the endpoint and create a new one — which
+mints a new signing secret, drops the delivery history, and requires the subscriber to redeploy. An
+endpoint is disabled *during* an incident, which is the worst hour in which to tell a customer to
+rotate a secret.
+
+`POST /v1/webhook-endpoints/:id/enable` (`src/server.ts:1178`) is the inverse. Two verbs rather than
+a `{ disabled: boolean }` body on one, because the two are not equally consequential and a boolean
+makes them look it: a client that inverted the flag would silently do the opposite of what its
+operator intended. Deliveries are **not** replayed on the way back — `enqueueDeliveries` selects
+`where e.disabled_at is null` (`src/webhooks.ts:380`), so nothing was queued while it was off. That
+is said out loud because the opposite is the reasonable assumption.
+
+### A console can ask which organisation it is in, without writing anything
+
+`findOrgByIdentityId` (`src/orgs.ts:162`) was reachable only from the event inbox, so the only way to
+answer "which developer organisation am I in?" was to re-`POST /v1/organisations` and read what came
+back — idempotent, therefore harmless, and still a mutation issued to ask a question.
+
+`GET /v1/organisations?identityOrgId=…` (`src/server.ts:784`) is the read. It cannot enumerate: the
+lookup key is the **identity** organisation id, which the caller must already hold, and authority is
+asked of identity with the caller's own token before the row is read at all — so a non-member gets
+the same 404 for "you are not a member" and "there is no such organisation" that identity itself
+gives, and that ambiguity is preserved rather than resolved. A **member** of an organisation that has
+never been enrolled gets `200 { "organisations": [] }`, which is an enrolment button rather than a
+dead end, and leaks nothing identity has not already confirmed.
+
 ### No money
 
 `usage_events` counts **calls**. There is no amount, price, currency or balance column anywhere in
@@ -382,7 +516,115 @@ both directions: a fresh correlation id replays, a different scope set still 409
 
 ---
 
-## 5. Running it
+## 5. The routes
+
+Read out of `src/server.ts`, not inferred from a client. Every line below was opened.
+
+**Who** is the mechanism the handler uses, and it is a property of the code rather than a label:
+
+| Who | What the handler calls |
+| --- | --- |
+| **none** | nothing. No credential is read at all. |
+| `key` | `authenticateKeyOnly` (`:572`) — an API key ONLY. A user JWT is a 403 (`:574`). |
+| `user+admin` | `authenticateUser` (`:565`) plus `permits(role, ADMIN_ROLES)` against identity (`:753`). |
+| `org:read` / `org:write` | `authoriseOrg` (`:645`) — a user token only, whose role in the identity organisation is asked of identity per request. |
+| `project:read` / `project:write` | `authoriseProject` (`:603`) — a user token OR an API key. A key may act only within its own project, because the project id is read from the ROW and never from the request (`:630-635`). |
+| **operator** | `isOperator` (`:553`) — a service token carrying `devplatform:admin`, or a user token with the platform role `admin`. **No organisation membership.** |
+| `service` | `authenticateService` (`:579`) — a service token carrying an exact scope. `/internal` only. |
+| `hmac` | a signature over the raw bytes, checked before `JSON.parse` (`:1473`). |
+
+### Public and customer surface
+
+| Method | Path | Who | `Idempotency-Key` | Line |
+| --- | --- | --- | --- | --- |
+| `GET` | `/livez` | none | — | `:685` |
+| `GET` | `/readyz` | none | — | `:687` |
+| `GET` | `/metrics` | none | — | `:692` |
+| `GET` | `/v1/scopes` | none | — | `:712` |
+| `GET` | `/v1/keys/self` | `key` | — | `:732` |
+| `POST` | `/v1/organisations` | `user+admin` | — | `:745` |
+| `GET` | `/v1/organisations` | user, member of the named identity org | — | `:784` |
+| `GET` | `/v1/organisations/:id` | `org:read` | — | `:799` |
+| `GET` | `/v1/organisations/:id/projects` | `org:read` | — | `:807` |
+| `POST` | `/v1/projects` | `org:write` | **required** | `:815` |
+| `GET` | `/v1/projects/:id` | `project:read` | — | `:838` |
+| `POST` | `/v1/projects/:id/service-accounts` | `project:write` | — | `:850` |
+| `GET` | `/v1/projects/:id/service-accounts` | `project:read` | — | `:861` |
+| `POST` | `/v1/projects/:id/keys` | `project:write` | **required** | `:880` |
+| `GET` | `/v1/projects/:id/keys` | `project:read` | — | `:934` |
+| `GET` | `/v1/keys/:id` | `project:read` | — | `:941` |
+| `DELETE` | `/v1/keys/:id` | `project:write` | — | `:956` |
+| `PUT` | `/v1/projects/:id/quotas` | `project:write` to **lower**; **operator** to raise or create | — | `:1011` |
+| `GET` | `/v1/projects/:id/quotas` | `project:read` | — | `:1063` |
+| `GET` | `/v1/projects/:id/usage` | `project:read` | — | `:1073` |
+| `POST` | `/v1/projects/:id/webhook-endpoints` | `project:write` | **required** | `:1083` |
+| `GET` | `/v1/projects/:id/webhook-endpoints` | `project:read` | — | `:1114` |
+| `POST` | `/v1/webhook-endpoints/:id/rotate-secret` | `project:write` | **required** | `:1123` |
+| `POST` | `/v1/webhook-endpoints/:id/disable` | `project:write` | — | `:1154` |
+| `POST` | `/v1/webhook-endpoints/:id/enable` | `project:write` | — | `:1178` |
+| `DELETE` | `/v1/webhook-endpoints/:id` | `project:write` | — | `:1188` |
+| `GET` | `/v1/webhook-endpoints/:id/deliveries` | `project:read` | — | `:1197` |
+| `POST` | `/v1/projects/:id/oauth-clients` | `project:write` | **required** | `:1207` |
+| `GET` | `/v1/projects/:id/oauth-clients` | `project:read` | — | `:1244` |
+| `DELETE` | `/v1/oauth-clients/:id` | `project:write` | — | `:1249` |
+| `GET` | `/v1/apps` | none | — | `:1263` |
+| `GET` | `/v1/apps/:slug` | none | — | `:1291` |
+| `PUT` | `/v1/projects/:id/application` | `project:write` | — | `:1298` |
+| `GET` | `/v1/projects/:id/application` | `project:read` | — | `:1312` |
+| `POST` | `/v1/projects/:id/application/submit` | `project:write` | — | `:1320` |
+
+### Operator only
+
+Ordinary `/v1` paths guarded in code, which is the estate's shape (`market/src/server.ts:1335-1341`)
+and what keeps them inside the prefixes the gateway already routes
+(`deploy/gateway/dynamic/public-api.yml:177`) rather than needing a rule this repository cannot write.
+
+| Method | Path | Line |
+| --- | --- | --- |
+| `GET` | `/v1/apps/pending` — the review queue, oldest first | `:1283` |
+| `PUT` | `/v1/projects/:id/application/status` — list, reject or delist | `:1344` |
+| `PUT` | `/v1/projects/:id/quotas` — when the request raises or creates | `:1020` |
+
+### Internal
+
+Refused from outside by `deploy/gateway/dynamic/policy.yml` at a priority nothing can outrank, **and**
+requiring a service token carrying `devplatform:introspect` — two controls, because the first is a
+deployment fact and the second is a code fact.
+
+| Method | Path | Who | Line |
+| --- | --- | --- | --- |
+| `POST` | `/internal/keys/verify` | `service` | `:1372` |
+| `POST` | `/internal/oauth/verify` | `service` | `:1392` |
+| `POST` | `/internal/usage` | `service` | `:1426` |
+| `POST` | `/v1/events` | `hmac` | `:1471` |
+
+**Six routes make no `authenticate()` call of any kind** — `/livez`, `/readyz`, `/metrics`,
+`GET /v1/scopes`, `GET /v1/apps` and `GET /v1/apps/:slug`. A client that sends a bearer to one of
+those is not refused; it is ignored, which is the harder thing to diagnose. `POST /v1/events` is the
+seventh that reads no `Authorization` header, but it is not public: it is HMAC-checked instead.
+
+### The constraints that carry meaning
+
+Each is in the schema rather than in a handler, and this is why.
+
+| Constraint | Refuses | Why here |
+| --- | --- | --- |
+| `api_keys_slow_kdf_only` | a credential row whose recorded algorithm is not a scrypt encoding | the day someone reaches for `createHash` because it is one line shorter, review is not what stops it (`src/migrations.ts:204`) |
+| `api_keys_scopes_no_wildcard` | a key carrying `*` | the schema outlives any particular write path, and the day someone adds a bulk import is the day `scopes.ts` is bypassed (`src/migrations.ts:210`) |
+| `api_keys_revoked_has_time` | a revocation with no time | a row claiming to be revoked without saying when cannot be reasoned about during an incident, which is the only time anyone reads it (`src/migrations.ts:214`) |
+| `quota_windows_within_limit` | an overage that got past the guarded UPDATE | the UPDATE is the mechanism; this is the belt, and it refuses the row rather than allowing a silent overage (`src/migrations.ts:365`) |
+| `quotas_max_within_ceiling` | a `minute` quota above 10,000,000, anything else above 10,000,000,000 | a quota's upper bound must hold against a caller with a database connection — a backfill, a psql session, a write path written next year — and the handler that had it did not (`src/migrations.ts:524-526`) |
+| `applications_listed_has_time` | a listed row with no `listed_at`, or the reverse | "when did this become visible?" is the first question asked after a bad listing, and a state that cannot be dated cannot be audited (`src/migrations.ts:427`) |
+| `applications_slug_not_reserved` | a listing whose slug is `pending` | `GET /v1/apps/pending` is matched before `GET /v1/apps/:slug`, so that listing would be unreachable at its own public address. A route ordering that has to be remembered is one that will be reordered (`src/migrations.ts:548-549`) |
+| `oauth_clients_redirects_absolute` | a wildcard or relative redirect URI | an open redirect hands an authorisation code to whoever asked for it (`src/migrations.ts:253-257`) |
+| `webhook_endpoints_url_https` | a plaintext delivery target | the signature proves origin; it does not provide confidentiality (`src/migrations.ts:282`) |
+
+`migrations.test.ts` writes the row each one exists to refuse and asserts the refusal. A CHECK that
+is never exercised is a comment with a table around it.
+
+---
+
+## 6. Running it
 
 ```bash
 pnpm install
@@ -405,7 +647,7 @@ recoverable from anything, because the secret half was never stored.
 `--test-concurrency=1` is required, not a preference: every database test file truncates between
 cases, a `TRUNCATE` takes an `AccessExclusiveLock`, and node:test runs *files* in parallel by default.
 
-**256 tests, 0 skipped.**
+**302 tests, 0 skipped.**
 
 ### Configuration
 
@@ -419,7 +661,7 @@ credentials, which is the shape of the omnipotent service tokens SD-05 exists to
 
 ---
 
-## 6. Things found in siblings, reported and not fixed
+## 7. Things found in siblings, reported and not fixed
 
 Each is in another repository and out of this one's scope.
 
@@ -457,7 +699,58 @@ Each is in another repository and out of this one's scope.
    half is another repository.
 
 5. **`src/migrations.ts` did not parse when this work resumed.** Two SQL comments carried unescaped
-   backticks inside a template literal (`` `*` `` at :193 and `` `verifyDelivery` `` at :277), which
+   backticks inside a template literal (`` `*` `` at :208 and `` `verifyDelivery` `` at :292), which
    closed the string early — migration 4 escapes its own, these two did not. Escaped rather than
    rewritten. Recorded here because it is a change to inherited code in this repository, not a
    sibling's defect.
+
+---
+
+## 8. Found in this repository, and what was done about each
+
+The four defects `micro-devportal-web` reported were real, and one was worse than stated. §4 covers
+each in full; this is the ledger, with what else turned up while fixing them.
+
+### Fixed
+
+| Finding | Where it was | What it is now |
+| --- | --- | --- |
+| A customer could raise their own quota to any value | `PUT /v1/projects/:id/quotas` required only `project:write`, `setQuota` had no ceiling | lowering is `project:write`, raising and creating are an operator's, and the top is a CHECK (§4) |
+| **Worse than reported:** an API KEY carrying `devplatform:write` could do it too | the same route — `authoriseProject` admits a key acting in its own project | `devplatform:admin` is absent from `src/scopes.ts`, so `validateScopes` refuses it at issuance and no key can ever hold it |
+| Nothing could approve a submitted application | `setApplicationStatus` was imported at `src/server.ts` and called by no handler | `PUT /v1/projects/:id/application/status` (`:1344`), plus the queue at `GET /v1/apps/pending` (`:1283`) that makes it addressable |
+| A rejection could not be told from a delisting | four statuses; a refused application had nowhere to go but `delisted` | `rejected` is its own status (migration 9), and `submitForReview` accepts it as a source so one "no" is not permanent |
+| No route resolved a developer organisation | `findOrgByIdentityId` was reachable only from the event inbox | `GET /v1/organisations?identityOrgId=…` (`:784`) |
+| A disabled webhook endpoint could not be re-enabled | `:1154` passed `true` unconditionally, no inverse | `POST /v1/webhook-endpoints/:id/enable` (`:1178`) |
+| `applications.ts` had **no test file** | the only case touching the directory wrote `update applications set status = 'listed'` by hand | `src/applications.test.ts`, 18 cases |
+| A guard in `routeidempotency.test.ts` could not fail | it sliced `server.ts` from `function buildRoutes` to `indexOf('/* ----')`, which finds the *first* such banner ~15 kB **earlier** — a backwards slice is `''`, so it searched nothing and passed for any input | ends at the banner that closes the route list, and asserts the extractor found a route block at all |
+
+### Reported, not fixed
+
+1. **A malformed path parameter is a 500, not a 400.** Eleven routes pass `ctx.params['id']`
+   straight to a `uuid` column, so `GET /v1/projects/not-a-uuid` (`src/server.ts:838` →
+   `authoriseProject` → `findProject`) surfaces Postgres `22P02` as `500 internal`. The same holds
+   for `GET /v1/keys/:id` (`:941`), `DELETE /v1/keys/:id` (`:956`), the four
+   `/v1/webhook-endpoints/:id` routes and `DELETE /v1/oauth-clients/:id` (`:1249`). A malformed URL
+   reported as a server fault also puts a 5xx on the dashboard for something no server did wrong.
+   `requireUuid` (`src/server.ts:1638`) exists and the two routes added here use it; changing the
+   status code of eleven shipped routes is a different decision, and `micro-devportal-web` pins
+   citations into every one of them.
+
+2. **`src/outbox.ts:29` names a file that does not exist.** "`topics.ts` carries the list a future
+   `contracts-devplatform` should adopt verbatim" — there is no `src/topics.ts` in this repository.
+   The list it describes is `TOPICS` at `src/outbox.ts:52-58`. A pointer to a file nobody wrote is
+   the kind of claim rule 1 of the README template exists to stop.
+
+3. **An environment with no quota row is unlimited, and nothing says so on the wire.**
+   `quotasFor` returns an empty list and `consumeAll` over it allows everything
+   (`src/quotas.ts:310-315`). `POST /v1/projects` seeds `minute` and `month` on both environments,
+   so a project created through the API is covered — but `hour` and `day` never have rows, and any
+   project created by another path has none at all. `GET /v1/projects/:id/quotas` reports the rows
+   that exist rather than the periods that are unmetered, so "no limit" and "no row" look identical
+   to a console. Left alone because inventing rows would change what a project costs; recorded so
+   the next reader does not have to rediscover it.
+
+4. **`GET /v1/projects/:id/quotas` is `project:read`, and quota rows are per environment.** A
+   `billing`-role member can therefore read a project's limits, which is right, but there is no
+   route that answers "what is the ceiling?" other than the `ceiling` field this change adds to the
+   `PUT` response. A console rendering a slider has to make one write to learn the range.

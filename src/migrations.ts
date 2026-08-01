@@ -41,6 +41,21 @@
  *                                 COUNT of calls. A column named for an amount here is the first
  *                                 row of a second ledger. CI greps for one.
  *
+ *   `quotas_max_within_ceiling`   A quota has a TOP as well as a bottom. `quotas_max_positive`
+ *                                 already refused zero; without this, `setQuota` accepted any
+ *                                 integer at all, so the only thing between a customer and an
+ *                                 unlimited plan was a handler. A CHECK holds against a caller
+ *                                 holding a database connection — a backfill, a psql session, a
+ *                                 write path written next year — and a handler does not. See
+ *                                 migration 9.
+ *
+ *   `applications_slug_not_      An application whose slug is `pending` would sit at
+ *   reserved`                     `/v1/apps/pending`, which is the operator's review queue, and
+ *                                 would therefore be unreachable at its own public address. The
+ *                                 collision is made UNREPRESENTABLE rather than documented: a
+ *                                 route ordering that has to be remembered is one that will be
+ *                                 reordered.
+ *
  *   `webhook_secrets` STORES      The one place in this service where a secret is stored
  *   PLAINTEXT, AND SAYS SO.       recoverably, because HMAC is not a one-way function of an input
  *                                 we do not have: signing a delivery requires the secret itself.
@@ -476,6 +491,62 @@ export const MIGRATIONS: readonly Migration[] = [
       );
 
       create index if not exists idempotency_keys_created_idx on idempotency_keys (created_at);
+    `,
+  },
+
+  {
+    version: 9,
+    name: 'quota-ceiling-and-application-review',
+    up: `
+      -- ═══════════════════════════════════════════════════════════════════════════════════════
+      -- A QUOTA HAS A TOP. Until this migration it had only a bottom.
+      --
+      -- quotas_max_positive refused zero from the first day. Nothing refused ten billion, so
+      -- setQuota accepted any whole number a caller sent and the only thing standing between a
+      -- customer and an unlimited plan was one line in a handler. The authority rule that says
+      -- who may RAISE a quota is in src/server.ts, where it has to be; this is the bound that
+      -- holds regardless of which write path arrives, because a CHECK holds against a caller
+      -- with a database connection and a handler does not. It is the same argument as
+      -- quota_windows_within_limit, one table over.
+      --
+      -- The numbers are not a judgement about what a plan should be. Each is the largest value
+      -- this service's OWN configuration already permits to be seeded into these rows —
+      -- src/env.ts:210 bounds DEVPLATFORM_DEFAULT_QUOTA_PER_MINUTE at 10,000,000 and :211 bounds
+      -- DEVPLATFORM_DEFAULT_QUOTA_PER_MONTH at 10,000,000,000 — so a legal configuration can
+      -- never be refused by the constraint guarding the rows it seeds. A per-minute allowance of
+      -- ten billion is not a limit anybody chose; it is a number nobody bounded.
+      --
+      -- ADDING THIS VALIDATES EVERY EXISTING ROW. If a quota is already above its ceiling this
+      -- statement fails with 23514 and the deploy stops, which is the intended behaviour: a
+      -- migration that silently rewrote somebody's limit would destroy the only record of what
+      -- it had been. The repair is a deliberate UPDATE, decided by a person, before the deploy.
+      -- ═══════════════════════════════════════════════════════════════════════════════════════
+      alter table quotas add constraint quotas_max_within_ceiling check (
+        max_units <= case when period = 'minute' then 10000000 else 10000000000 end
+      );
+
+      -- ═══════════════════════════════════════════════════════════════════════════════════════
+      -- A REJECTED APPLICATION IS NOT A DELISTED ONE.
+      --
+      -- The original vocabulary was draft | in_review | listed | delisted, so an application an
+      -- operator refused had nowhere to go but 'delisted' — the same value as a listing that WAS
+      -- public and was taken down. Those are different facts about a developer ("we looked and
+      -- said no" against "you were live and we removed you"), they are answered differently by
+      -- support, and one of them is a resubmission and the other is an appeal.
+      --
+      -- 'rejected' is added rather than 'delisted' being redefined, because a delisted row today
+      -- genuinely was listed once: applications_listed_has_time forced a listed_at onto it.
+      -- ═══════════════════════════════════════════════════════════════════════════════════════
+      alter table applications drop constraint if exists applications_status_known;
+      alter table applications add constraint applications_status_known
+        check (status in ('draft','in_review','listed','rejected','delisted'));
+
+      -- The operator's review queue is served at /v1/apps/pending, in front of /v1/apps/:slug.
+      -- A listing that took 'pending' as its slug would be shadowed by that route and could never
+      -- be fetched at its own public address. Refused here rather than remembered in the router:
+      -- an ordering that has to be preserved by hand is one that will be reordered by hand.
+      alter table applications add constraint applications_slug_not_reserved
+        check (slug <> 'pending');
     `,
   },
 ]
