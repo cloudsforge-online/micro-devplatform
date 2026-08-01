@@ -190,7 +190,7 @@ export const MIGRATIONS: readonly Migration[] = [
         constraint api_keys_hash_is_hex check (secret_hash ~ '^[0-9a-f]{32,}$' and secret_salt ~ '^[0-9a-f]{16,}$'),
 
         -- No wildcard reaches a row. scopes.ts refuses one at issuance; this refuses one however
-        -- it arrived. `*` is not a LIKE metacharacter, so this matches it literally, and an empty
+        -- it arrived. \`*\` is not a LIKE metacharacter, so this matches it literally, and an empty
         -- array joins to '' and passes — an empty scope set is legal and inert, not a wildcard.
         constraint api_keys_scopes_no_wildcard check (array_to_string(scopes, ',') not like '%*%'),
 
@@ -274,7 +274,7 @@ export const MIGRATIONS: readonly Migration[] = [
       --
       -- Two rows may be live at once. Rotation signs with the newest and keeps the previous valid
       -- for an overlap window, so a subscriber updates its configuration without dropping a
-      -- delivery. `verifyDelivery` in @cloudsforge/contracts-events accepts a list of secrets for
+      -- delivery. \`verifyDelivery\` in @cloudsforge/contracts-events accepts a list of secrets for
       -- exactly this reason (contracts/packages/events/src/index.ts:718).
       create table if not exists webhook_secrets (
         id                 uuid        primary key default gen_random_uuid(),
