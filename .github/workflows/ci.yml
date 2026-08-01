@@ -1,0 +1,63 @@
+name: CI
+
+# The whole file. Every service in the estate calls the ONE reusable workflow in micro-org rather
+# than carrying its own copy — the measured target in docs/ecosystem/03 §5 is zero bespoke CI files.
+# If this repository ever needs a job of its own, that is the signal the reusable workflow needs an
+# input, not that this repository needs a fork of it.
+#
+# `service-ci.yml` typechecks, runs the suite against a real Postgres `ci_test` container, and FAILS
+# the build if the database-backed suite skipped — which is why `src/testsupport.ts` reads
+# `DEVPLATFORM_TEST_DATABASE_URL` spelled exactly as the workflow derives it from
+# `database-env-var`. It also enforces the estate rules (one database, no cross-service imports, the
+# three health endpoints, no unleased timers) that repository walls used to enforce for free.
+#
+# A skipped suite here would be worse than in most repositories: the properties this service exists
+# to hold — a concurrent quota that cannot be exceeded, two workers producing one job run, a
+# constraint that refuses SHA-256 in the credential table — are all database properties, and not one
+# of them exists in a fake. A green build with the database suite skipped would be proving the
+# handful of pure functions and nothing that matters.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: devplatform
+      database-env-var: DEVPLATFORM_DATABASE_URL
+      # 4000 inside the container, as every service but foresight binds. Read from this repository's
+      # own Dockerfile EXPOSE and src/env.ts default rather than chosen here — a port is a fact
+      # about a service, not an allocation, and picking a free-looking number is how `emberkin` was
+      # registered on 3014 while it binds 4100.
+      port: 4000
+      # The image startup smoke test boots the real service, and `env.ts` validates its configuration
+      # at import — so the container needs the variables it declares, not just a database, or it
+      # exits before it serves /livez. These are CI-only NON-secrets: throwaway values that only have
+      # to clear a length and placeholder check, and a JWKS URL that is never dialled because /livez
+      # needs no identity. Never a real credential.
+      #
+      # Note what is NOT here: there is no DEVPLATFORM_ADMIN_TOKEN to supply, because this service
+      # has no break-glass credential and no reveal switch. `env.test.ts` asserts that by name.
+      smoke-env: |
+        IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
+        IDENTITY_ISSUER=http://127.0.0.1:4001
+        DEVPLATFORM_INGEST_SECRETS=ci-only-not-a-real-secret-00000000
+        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-11111111
+    secrets:
+      # @cloudsforge/* is resolved by link:../runtime and link:../contracts, so CI checks out
+      # micro-runtime and micro-contracts as siblings — both private, so the workflow needs a
+      # contents:read token. This service takes BOTH: src/outbox.ts imports
+      # @cloudsforge/contracts-events for the delivery signature scheme.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
+
+  hygiene:
+    uses: cloudsforge-online/micro-org/.github/workflows/secret-hygiene.yml@main
+    permissions:
+      contents: read
