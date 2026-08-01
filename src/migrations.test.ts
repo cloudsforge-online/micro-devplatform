@@ -128,7 +128,7 @@ test('the schema', { skip }, async (t) => {
       created_by: 'user:test',
       ...overrides,
     }
-    await sql`insert into api_keys ${sql(row as Record<string, never>)}`
+    await sql`insert into api_keys ${sql(row as unknown as Record<string, never>)}`
   }
 
   await t.test('a well-formed key row inserts', async () => {
