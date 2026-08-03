@@ -62,6 +62,7 @@ import {
   adoptedProposals,
   envelopeDefects,
   malformedProposals,
+  recipientOf,
   undeclaredTopics,
   unemittedOwnedTopics,
 } from './topics.ts'
@@ -439,6 +440,138 @@ test('the delivery this relay signs is one a contract-following consumer verifie
   assert.equal(SIGNATURE_HEADER, 'cf-signature')
   const verification = verifyDelivery(body, signEvent(body, secret), [secret])
   assert.equal(verification.ok, true)
+})
+
+/* ------------------------------------------------------------------ the person */
+
+/**
+ * **A REVOCATION MUST REACH A PERSON, AND EVERY CHECK ABOVE IS GREEN WHEN IT REACHES NOBODY.**
+ *
+ * `THE RULE` above asks whether the estate would ACCEPT this envelope. For the whole life of this
+ * service the answer was yes and the answer was worthless: the organisation-erasure path revoked
+ * every live key a company held, as `service:identity`, and the payload named no user — so
+ * `activity` filed it internal as `api.key_revoked_by_platform` and `notify` answered
+ * `no_recipient`, both correctly, and a developer's integrations died in silence.
+ *
+ * ## Why this is not a test that a field is present
+ *
+ * Because that test is weaker than it looks, and this estate has been caught by the difference
+ * twice tonight. An end-to-end feed test stayed green with the consuming classifier DELIBERATELY
+ * BROKEN, because the payload lacked the field and an absent field is null to every reader — so
+ * "nobody was reached" was the expected answer either way. The cure is the order below: **feed the
+ * reader YESTERDAY'S PAYLOAD SHAPE FIRST** and require it to reach nobody, then today's and require
+ * it to reach the owner. The first assertion fails if `recipientOf` would answer for any reason
+ * other than this field; the second fails if the field stops arriving. Neither can be satisfied by
+ * an empty result.
+ *
+ * `withoutOwner` is not a hypothetical: it is exactly what `emitKeyRevoked` built until this
+ * commit.
+ */
+function withoutOwner(payload: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...payload }
+  delete copy['userId']
+  return copy
+}
+
+/** The one revocation event `emitKeyRevoked` produces for a key, through the real relay. */
+function revocationEnvelope(key: typeof KEY_FIXTURE, actor: Actor): Record<string, unknown> {
+  const emitted: Parameters<Emit>[0][] = []
+  emitKeyRevoked((event) => void emitted.push(event), key, actor)
+  const event = emitted[0]
+  assert.equal(emitted.length, 1, 'emitKeyRevoked must produce exactly one event')
+  assert.ok(event)
+  const envelope = buildEnvelope({
+    ...ROW,
+    topic: event.topic,
+    key: event.key,
+    actor: (event.actor ?? null) as string | null,
+    payload: event.payload,
+  })
+  return JSON.parse(JSON.stringify(envelope)) as Record<string, unknown>
+}
+
+const OWNER = '018f0000-0000-7000-8000-0000000000c1'
+
+test('A KEY THE PLATFORM REVOKES REACHES ITS OWNER, WHO IS NOT THE ACTOR', () => {
+  // The erasure path — server.ts:1575. `service:identity` is the honest actor and is not a person.
+  const envelope = revocationEnvelope(KEY_FIXTURE, 'service:identity')
+
+  // Yesterday, FIRST. A perfectly valid envelope that lands on nobody: the gap, reproduced.
+  const yesterday = { ...envelope, payload: withoutOwner(envelope['payload'] as Record<string, unknown>) }
+  assert.deepEqual(
+    envelopeDefects(yesterday),
+    [],
+    'the envelope that reached nobody was VALID — which is why no check in this repository saw it',
+  )
+  assert.equal(
+    recipientOf(yesterday),
+    null,
+    'yesterday\'s payload reached somebody, so the assertion below proves nothing about the new field',
+  )
+
+  // Today.
+  assert.equal(
+    recipientOf(envelope),
+    OWNER,
+    'a mass revocation still reaches nobody — the developer whose keys just died is not told',
+  )
+
+  // And the platform is STILL the platform. `activity` discriminates `api.key_revoked_by_platform`
+  // from `api.key_revoked` on the actor alone (`activity/src/classify.ts:1096`), so naming the
+  // owner must not make an erasure read as something the owner did.
+  assert.equal(envelope['actor'], 'service:identity')
+  assert.deepEqual(envelopeDefects(envelope), [])
+})
+
+test('the owner is read from the key, not from whoever pressed delete', () => {
+  // server.ts:999, where an ADMIN revokes a key a COLLEAGUE created. The actor is the admin; the
+  // integration that stops belongs to the colleague, and it is the colleague who has to fix it.
+  const admin = '018f0000-0000-7000-8000-0000000000c9'
+  const envelope = revocationEnvelope(KEY_FIXTURE, `user:${admin}`)
+  assert.equal(recipientOf(envelope), OWNER)
+  assert.notEqual(recipientOf(envelope), admin)
+
+  // Without the field this envelope resolved the ADMIN — a receipt for the one person who already
+  // knew, and nothing for the one who did not.
+  const yesterday = { ...envelope, payload: withoutOwner(envelope['payload'] as Record<string, unknown>) }
+  assert.equal(recipientOf(yesterday), admin)
+})
+
+test('a key minted by a key names nobody, rather than guessing', () => {
+  // `actorOf` for a KeyPrincipal is `service:<display>`, so `created_by` names no person. notify's
+  // own rule is that this must stay silent: "a key minting a key is no person's news, and guessing
+  // would tell the wrong person that their credentials changed" (notify/src/catalogue.ts:717).
+  // Absent rather than null or empty — an absent field is the only one that does not claim to have
+  // answered.
+  const serviceOwned = { ...KEY_FIXTURE, createdBy: `service:${KEY_FIXTURE.display}` }
+  const envelope = revocationEnvelope(serviceOwned, 'service:identity')
+  assert.equal(recipientOf(envelope), null)
+  assert.equal('userId' in (envelope['payload'] as Record<string, unknown>), false)
+  assert.deepEqual(envelopeDefects(envelope), [])
+
+  // A `created_by` that is not a well-formed subject at all — an older row, a hand-written fixture
+  // — is refused for the same reason: `activity` files against `activity_records.user_id`, and a
+  // non-uuid there is a record no feed query can ever return.
+  for (const createdBy of ['user_test', 'user:', 'user:not-a-uuid', 'operator:ops']) {
+    const odd = revocationEnvelope({ ...KEY_FIXTURE, createdBy }, 'service:identity')
+    assert.equal((odd['payload'] as Record<string, unknown>)['userId'], undefined, createdBy)
+    assert.equal(recipientOf(odd), null, createdBy)
+  }
+})
+
+test('the recipient reader is the consumers\' order, and can answer null', () => {
+  // The model is only worth anything if it can fail. Each branch, in the order notify's `userIdOf`
+  // applies them (`notify/src/catalogue.ts:216`).
+  const base = revocationEnvelope(KEY_FIXTURE, 'service:identity')
+  assert.equal(recipientOf({ ...base, payload: {}, actor: 'service:identity' }), null)
+  assert.equal(recipientOf({ ...base, payload: {}, actor: `user:${OWNER}` }), OWNER)
+  // The payload wins over the actor when both name somebody, which is what makes the erasure path
+  // and the colleague case above resolve the owner rather than the revoker.
+  assert.equal(recipientOf({ ...base, actor: 'user:018f0000-0000-7000-8000-0000000000c9' }), OWNER)
+  // Not an envelope at all, and an actor the contract refuses outright.
+  assert.equal(recipientOf(null), null)
+  assert.equal(recipientOf({ ...base, payload: {}, actor: 'system:identity' }), null)
+  assert.equal(recipientOf({ ...base, payload: {}, actor: `key:${KEY_FIXTURE.display}` }), null)
 })
 
 /* ------------------------------------------------------------------ reachability */

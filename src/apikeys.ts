@@ -365,7 +365,84 @@ export async function revokeByDisplay(
   return revokeApiKey(tx, { ...input, id: row.id })
 }
 
+const USER_ACTOR =
+  /^user:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/
+
+/**
+ * The person whose credential this is, or null when no person holds it.
+ *
+ * `created_by` is written as `actorOf(caller)` (`server.ts:701`), so it is `user:<uuid>` for a
+ * developer who pressed the button and `service:<display>` for a key that minted a key. Only the
+ * first names somebody, and the uuid is required rather than assumed: `activity` files a record
+ * against `activity_records.user_id`, and a subject that is not a uuid is a value no feed query
+ * can ever match — a record filed against a user who does not exist reads exactly like a record
+ * that was delivered.
+ *
+ * **This reads a column, and `emitKeyIssued` two hundred lines up refuses to.** The difference is
+ * what is being carried. `actor` is an `Actor`, a type the compiler proved on the way in and that
+ * a column round-trip launders back to `string` — so that one is taken from the caller. This is an
+ * IDENTIFIER, it is validated here at the point of use rather than trusted, and there is no caller
+ * to take it from: on the erasure path the caller is `identity`, and the whole point is that the
+ * owner is somebody else.
+ */
+export function ownerUserIdOf(createdBy: string): string | null {
+  return USER_ACTOR.exec(createdBy)?.[1] ?? null
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **`userId` IS WHOSE KEY IT WAS. `actor` IS WHO REVOKED IT. THEY ARE NOT THE SAME QUESTION.**
+ *
+ * Until this field existed, they were forced to be. Every consumer in the estate derives the owner
+ * of an event from the ENVELOPE ACTOR when the payload names nobody — `activity`'s `userFromActor`
+ * (`activity/src/classify.ts:148`) and `notify`'s `userIdOf` (`notify/src/catalogue.ts:216`) both
+ * fall back to it — and that is right for the route at `server.ts:999`, where a developer presses
+ * DELETE and the actor is that developer.
+ *
+ * It is wrong for the other caller, and wrong in the case that matters most. `server.ts:1575`
+ * handles `identity.organisation.deleted`: it suspends the organisation and revokes EVERY live key
+ * it holds, as `service:identity`, because that IS who acted. So the actor named a service, both
+ * consumers correctly answered "no user on this envelope", `activity` filed the record internal as
+ * `api.key_revoked_by_platform` and `notify` answered `no_recipient`. A company's entire production
+ * integration stopped at whatever hour identity processed the erasure and **nobody was told**.
+ * Both consumers wrote the gap down and both refused to close it themselves, correctly: neither may
+ * read a database to find out whose keys those were, so the fan-out has to come from the payload.
+ *
+ * ## Why one event per key, and not one event carrying every affected user
+ *
+ * `worlds/src/heraldry.ts` faced this fan-out and put the whole membership on one payload, because
+ * a season has one seal and many victors. This is the opposite shape, for two reasons:
+ *
+ *   1. **This service could not build that list.** devplatform holds no membership table on
+ *      purpose (`membership.ts`: "IDENTITY IS ASKED. NOTHING IS MIRRORED"), and it asks identity
+ *      with the CALLER'S OWN token — which does not exist on an erasure the caller is a service.
+ *      `api_keys.created_by` is the only user this service knows, and it is already on the row
+ *      `revokeOrgKeys` returns.
+ *   2. **A revoked key is per-key news whatever revoked it.** The registry keys this topic by
+ *      `key_id` and `11-data-and-contract-strategy.md:363` names it as the estate's key-cache
+ *      flush, so a per-key event has to exist regardless. Collapsing N keys into one event would
+ *      break the flush to save a field.
+ *
+ * That answers the hazard heraldry records — one shared synthetic id let exactly one alliance
+ * member win an insert and handed every other member a silent null — **structurally rather than by
+ * a convention a consumer has to keep.** One event per key means one event id per key, the estate's
+ * inbox dedupes on `(topic, event_id)`, and `notify`'s dedupe key for this rule is already
+ * `api.key_revoked:<key_id>`. Two users' keys can never collide on either, so per-user idempotency
+ * is not something the consumers must remember to do; it is what they already do.
+ *
+ * ## One payload shape, both callers
+ *
+ * The field is added HERE rather than at either call site, so `emitKeyRevoked` still has exactly
+ * one payload shape. `micro-contracts` checked precisely that before registering this topic ("One
+ * payload shape each", `contracts/packages/events/src/index.ts:697`) — a `TopicSpec` gives a topic
+ * one `payloadType`, and a payload that differs by which path produced it is unregisterable by
+ * construction, which is what made `identity.mfa.changed` impossible to adopt. `userId` is absent,
+ * never null or empty, when no person holds the key: an absent field and a null read identically
+ * to every consumer, and absent is the one that does not claim to have answered.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
 export function emitKeyRevoked(emit: Emit, key: ApiKeySummary, actor: Actor): void {
+  const owner = ownerUserIdOf(key.createdBy)
   emit({
     topic: TOPICS.keyRevoked,
     key: key.id,
@@ -377,6 +454,7 @@ export function emitKeyRevoked(emit: Emit, key: ApiKeySummary, actor: Actor): vo
       display: key.display,
       lookupId: key.lookupId,
       reason: key.revokedReason ?? '',
+      ...(owner === null ? {} : { userId: owner }),
     },
   })
 }

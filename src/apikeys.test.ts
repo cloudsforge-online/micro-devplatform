@@ -376,7 +376,11 @@ test('api keys', { skip }, async (t) => {
     const other = await seedKey(sql, theirs.project.id)
     await tx((t) => revokeApiKey(t, { id: b.key.id, revokedBy: 'user:x', reason: 'earlier' }))
 
-    const revoked = await tx((t) => revokeOrgKeys(t, mine.org.id, 'system:identity', 'organisation deleted'))
+    // `service:identity`, the string `server.ts:1575` really passes. `system:identity` stood here
+    // until contracts registered this topic and proved `system` is the one kind with no subject —
+    // and `revoked_by` takes the same string the event's `Actor` does, so a fixture that disagrees
+    // with production is a fixture that agrees with a defect.
+    const revoked = await tx((t) => revokeOrgKeys(t, mine.org.id, 'service:identity', 'organisation deleted'))
     assert.deepEqual(revoked.map((k) => k.id), [a.key.id], 'only the LIVE keys should be revoked')
 
     assert.equal((await auth(a.secretKey)).ok, false)

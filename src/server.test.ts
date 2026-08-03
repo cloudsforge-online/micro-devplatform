@@ -39,7 +39,8 @@ import {
   type ServerDeps,
 } from './server.ts'
 import { MAX_UNITS_CEILING } from './quotas.ts'
-import { signEvent, type Db } from './outbox.ts'
+import { buildEnvelope, signEvent, type Db } from './outbox.ts'
+import { envelopeDefects, recipientOf } from './topics.ts'
 import { parseKey } from './keys.ts'
 import { MembershipUnavailableError, type MembershipClient, type OrgRole } from './membership.ts'
 import {
@@ -781,6 +782,119 @@ test('the server', { skip }, async (t) => {
     // And the revocation is announced, so a cache at the edge is invalidated rather than waited out.
     const outbox = await sql<{ topic: string }[]>`select topic from outbox order by occurred_at`
     assert.ok(outbox.some((row) => row.topic === 'devplatform.key.revoked'))
+  })
+
+  /**
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE MASS REVOCATION REACHES EVERY PERSON WHOSE KEYS DIED — THROUGH THE REAL ROUTE.**
+   *
+   * The test above proves the keys are revoked and an event is emitted. Both were true for the
+   * whole life of this service while the news reached NOBODY: the actor is `service:identity`,
+   * every consumer in the estate derives the owner from the actor when the payload names no user,
+   * so `activity` filed the record internal and `notify` answered `no_recipient`. A company's
+   * production integration stopped at whatever hour identity processed the erasure, in silence.
+   *
+   * This runs the real HTTP route, the real handler, the real `revokeOrgKeys`, the real
+   * `emitKeyRevoked`, the real `outbox` rows and the real `buildEnvelope` — so the actor and the
+   * owner both make a round trip through the COLUMNS, which is where a type guarantee is laundered
+   * back to `string | null`. Then it asks who each envelope lands on.
+   *
+   * **Yesterday's payload shape is fed to the reader FIRST.** An end-to-end test elsewhere in this
+   * estate stayed green with the consuming classifier deliberately broken, because the payload
+   * lacked the field and an absent field is null to every reader — so "reached nobody" was the
+   * expected answer either way. Asserting the old shape reaches nobody and the new shape reaches
+   * the owner is the pair that cannot both pass by accident.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  await t.test('A MASS REVOCATION REACHES EVERY PERSON WHOSE KEYS IT KILLED', async () => {
+    const { org, project } = await scenario()
+    // Two developers with keys in one organisation, and one key a KEY minted. A mass revocation
+    // spans as many people as the organisation has, which is why the fan-out cannot come from the
+    // single actor on the envelope.
+    const alice = '018f0000-0000-7000-8000-00000000a11c'
+    const bob = '018f0000-0000-7000-8000-00000000b0b0'
+    await seedKey(sql, project.id, { name: 'alice ci', createdBy: `user:${alice}` })
+    await seedKey(sql, project.id, { name: 'alice deploy', createdBy: `user:${alice}` })
+    await seedKey(sql, project.id, { name: 'bob nightly', createdBy: `user:${bob}` })
+    await seedKey(sql, project.id, { name: 'minted by a key', createdBy: 'service:cfk_live_0011223344556677' })
+
+    const raw = envelopeFor('identity.organisation.deleted', { organisationId: org.identityOrgId })
+    const answer = await call('POST', '/v1/events', {
+      rawBody: raw,
+      headers: { 'cf-signature': signEvent(raw, INGEST_SECRET) },
+    })
+    assert.equal(answer.json['revoked'], 4)
+
+    const rows = await sql<
+      {
+        id: string
+        topic: string
+        key: string
+        occurred_at: Date
+        producer: string
+        version: number
+        actor: string | null
+        correlation_id: string | null
+        payload: Record<string, unknown>
+      }[]
+    >`
+      select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
+        from outbox where topic = 'devplatform.key.revoked' order by id
+    `
+    assert.equal(rows.length, 4, 'one revocation event per key — the per-key event IS the fan-out')
+
+    const envelopes = rows.map(
+      (row) => JSON.parse(JSON.stringify(buildEnvelope(row))) as Record<string, unknown>,
+    )
+    for (const envelope of envelopes) {
+      assert.deepEqual(
+        envelopeDefects(envelope),
+        [],
+        'an event no consumer will accept reaches nobody for a reason this test would not name',
+      )
+      // The platform did this, and the envelope must keep saying so: `activity` discriminates
+      // `api.key_revoked_by_platform` from `api.key_revoked` on the actor alone.
+      assert.equal(envelope['actor'], 'service:identity')
+    }
+
+    // ── YESTERDAY. Four valid envelopes, four users with dead integrations, nobody told. ──
+    const before = envelopes.map((envelope) => {
+      const payload = { ...(envelope['payload'] as Record<string, unknown>) }
+      delete payload['userId']
+      return { ...envelope, payload }
+    })
+    assert.deepEqual(
+      before.map(recipientOf),
+      [null, null, null, null],
+      'the pre-change payload reached somebody, so the assertions below prove nothing',
+    )
+
+    // ── TODAY. ──
+    const reached = envelopes.map(recipientOf)
+    assert.equal(
+      reached.filter((user) => user === alice).length,
+      2,
+      'alice held two keys and both died — she is told about each, or the guard is a field check',
+    )
+    assert.equal(reached.filter((user) => user === bob).length, 1, 'bob was not told')
+    assert.equal(
+      reached.filter((user) => user === null).length,
+      1,
+      "a key minted by a key is no person's news, and guessing would tell the wrong person",
+    )
+
+    /*
+     * **PER-USER IDEMPOTENCY, WHICH IS WHAT ONE EVENT PER KEY BUYS.**
+     *
+     * `worlds/src/heraldry.ts` records the hazard this avoids: one alliance-wide synthetic id let
+     * exactly ONE member win the insert and handed every other member a silent null. Here the
+     * producer fans out, so the dedupe identity is the event id — the estate's inbox dedupes on
+     * `(topic, event_id)` and notify's key for this rule is `api.key_revoked:<key_id>`. Two of
+     * alice's keys sharing either would silently drop one of her two dead integrations.
+     */
+    const aliceRows = rows.filter((_, index) => reached[index] === alice)
+    assert.equal(new Set(aliceRows.map((row) => row.id)).size, 2, 'two of alice\'s events share an id')
+    assert.equal(new Set(aliceRows.map((row) => row.key)).size, 2, 'two of alice\'s events share a key')
   })
 
   await t.test('THE SAME EVENT DELIVERED TWICE IS PROCESSED ONCE', async () => {

@@ -131,6 +131,17 @@ export async function seedWorkspace(
   return { org, project }
 }
 
+/**
+ * The default owner of a seeded key, as an `Actor` and with a UUID subject.
+ *
+ * This was `'user_test'`, which is neither. `created_by` is written as `actorOf(caller)` in
+ * production (`server.ts:701`), and since `emitKeyRevoked` now derives the revocation's `userId`
+ * from that column, a fixture in a shape no code path produces would have let every seeded key
+ * emit an event that reaches nobody while the suite stayed green — the fixture answering the
+ * question instead of the service, which is the failure `topics.test.ts` was rewritten to stop.
+ */
+export const TEST_KEY_OWNER = '018f0000-0000-7000-8000-00000000f00d'
+
 export async function seedKey(
   sql: postgres.Sql,
   projectId: string,
@@ -139,6 +150,8 @@ export async function seedKey(
     readonly scopes?: readonly string[]
     readonly name?: string
     readonly expiresAt?: Date | null
+    /** `user:<uuid>` or `service:<display>` — the two `actorOf` really produces. */
+    readonly createdBy?: string
   } = {},
 ): Promise<IssuedApiKey> {
   const outcome = await sql.begin(async (tx) => ({
@@ -149,7 +162,7 @@ export async function seedKey(
         environment: options.environment ?? 'live',
         name: options.name ?? 'test key',
         scopes: options.scopes ?? ['devplatform:read'],
-        createdBy: 'user_test',
+        createdBy: options.createdBy ?? `user:${TEST_KEY_OWNER}`,
         expiresAt: options.expiresAt ?? null,
       },
       { params: TEST_PARAMS },

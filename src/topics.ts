@@ -73,9 +73,11 @@
  */
 
 import {
+  TOPICS as REGISTRY,
   classifyEnvelope,
   isRegisteredTopic,
   isValidTopicName,
+  parseActor,
   topicsProducedBy,
   type TopicName,
   type TopicSpec,
@@ -271,5 +273,75 @@ export function envelopeDefects(envelope: unknown): readonly string[] {
       ? [`topic: "${verdict.unregisteredTopic}" is not in the registry, and AWAITING_REGISTRATION does not propose it`]
       : []
   return [...unexplained, ...verdict.defects]
+}
+
+/* ------------------------------------------------------------------ the person */
+
+const UUID_SUBJECT = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
+
+/**
+ * **Which PERSON a delivered envelope reaches — the consumers' own rule, transcribed.**
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * A valid envelope is not a delivered one. `envelopeDefects` above answers "would a consumer refuse
+ * this?", and every check in this repository stopped there — which is exactly far enough to miss
+ * the defect this function exists for. `devplatform.key.revoked` passed every envelope check ever
+ * written here while the organisation-erasure path reached NOBODY: the actor was `service:identity`,
+ * the payload named no user, so both consumers resolved no recipient and were right to. A test
+ * asserting "the envelope is acceptable" is green throughout that. So is a test asserting a field
+ * is PRESENT. Only a test that asks who the event lands on can fail.
+ *
+ * ## Whose rule this is, line by line
+ *
+ * The order is `notify`'s `userIdOf` (`notify/src/catalogue.ts:216-225`), which every rule built
+ * with `forUser` uses, and which `activity` matches with `userFromPayload` then `userFromActor`
+ * (`activity/src/classify.ts:113` and `:148`):
+ *
+ *   1. the payload's `user_id` / `userId`;
+ *   2. the envelope key, for a topic the registry says is `keyedBy: 'user_id'` — neither of this
+ *      service's registered topics is, both are `key_id`, and the branch is kept anyway because
+ *      dropping a step of somebody else's rule is how a transcription stops being one;
+ *   3. an `actor` of `user:<id>`, last, because the actor is who ACTED and the record belongs to
+ *      whose news it is. Those coincide often and diverge where it costs most.
+ *
+ * ## Two deliberate strictnesses, and why they are the safe direction
+ *
+ * `parseActor` rather than `actor.startsWith('user:')` — `activity` uses the contract's parser and
+ * says why: this service shipped `key:<display>` and `system:identity`, and a local prefix test
+ * reads both as "not a user" for the right answer by luck rather than refusing them as illegal.
+ * And the subject must be a UUID, which `activity` requires and `notify` does not. Both make this
+ * the STRICTER of the two consumers, so a user it resolves is a user BOTH of them reach. A model
+ * that is easier to satisfy than the real reader is a model that passes for envelopes the estate
+ * drops, which is the class of self-agreeing fake this whole file exists to stop.
+ *
+ * It is a transcription, so it can drift from the services it copies. What stops that mattering is
+ * that it is only ever used to prove reachability is NON-empty, on envelopes this service's own
+ * relay built — the direction where being wrong means a red build here, not a silent gap there.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export function recipientOf(envelope: unknown): string | null {
+  if (typeof envelope !== 'object' || envelope === null) return null
+  const record = envelope as Record<string, unknown>
+  const payload =
+    typeof record['payload'] === 'object' && record['payload'] !== null
+      ? (record['payload'] as Record<string, unknown>)
+      : {}
+
+  for (const field of ['user_id', 'userId']) {
+    const value = payload[field]
+    if (typeof value === 'string' && UUID_SUBJECT.test(value)) return value
+  }
+
+  const topic = record['topic']
+  const spec = typeof topic === 'string' && isRegisteredTopic(topic) ? REGISTRY[topic] : undefined
+  const key = record['key']
+  if (spec?.keyedBy === 'user_id' && typeof key === 'string' && UUID_SUBJECT.test(key)) return key
+
+  const actor = record['actor']
+  if (typeof actor !== 'string') return null
+  const parsed = parseActor(actor)
+  if (!parsed.ok || parsed.value.kind !== 'user') return null
+  const id = parsed.value.id
+  return id !== null && UUID_SUBJECT.test(id) ? id : null
 }
 
