@@ -19,16 +19,19 @@
  * updated and the next verification here refuses — and the event is what makes it immediate
  * everywhere else.
  *
- * **A DEFECT IN THE INHERITED CONTRACT, RECORDED NOT FIXED.** `devplatform.key.revoked` is not a
- * registered topic. `contracts/packages/events/src/index.ts:222` freezes `TOPICS` and
- * `TopicName = keyof typeof TOPICS` (:351) closes the set; `devplatform` is a legal
- * `ProducerService` (:194) but has no topic of its own in the registry. So the mechanism
- * 11:363 names by string cannot be constructed through `makeEvent`, which takes a `TopicName`.
- * `micro-contracts` is another repository and out of scope, so the topic names are local
- * constants here, validated with `isValidTopicName` — the shape check, which they pass — rather
- * than `isRegisteredTopic`, which they cannot until the contract package adds them. `topics.ts`
- * carries the list a future `contracts-devplatform` should adopt verbatim, as a SELF-EMPTYING
- * quarantine: the day contracts registers one, the test there fails until the entry is deleted.
+ * **THAT MECHANISM NOW EXISTS. IT DID NOT BEFORE.** `devplatform.key.revoked` was not a registered
+ * topic for the whole life of this service: `contracts/packages/events/src/index.ts` freezes
+ * `TOPICS` and `TopicName = keyof typeof TOPICS` closes the set, and `devplatform` was a legal
+ * `ProducerService` with no topic of its own in it. So the mechanism 11:363 names by string could
+ * not be constructed through `makeEvent`, which takes a `TopicName`, and no consumer could classify
+ * what this service emitted. Revocation was immediate here and immediate nowhere else.
+ *
+ * `micro-contracts` `8889373` adopted `devplatform.key.issued` and `devplatform.key.revoked`
+ * verbatim from the quarantine in `topics.ts`, which is that quarantine doing what it was built to
+ * do — the entries were deleted the same day, because the test there fails while an adopted entry
+ * remains. The three topics below that are still unregistered stay local constants, validated with
+ * `isValidTopicName` (the shape check, which they pass) rather than `isRegisteredTopic` (which they
+ * cannot pass yet), and `topics.ts` still carries the spec each is asking for.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  * ## The envelope was unreadable, and the signature being right hid it
@@ -40,14 +43,23 @@
  * "version: missing". A delivery whose signature verified perfectly was thrown away at the
  * envelope before anything looked at a payload.
  *
- * That has not yet cost this service an event, and only by an accident worth naming: no
- * `devplatform.*` topic is registered, so `activity`'s ingest takes the unregistered-topic branch
- * and quarantines rather than validating. The moment `devplatform.key.revoked` IS registered —
- * which is the whole point of the box above — every delivery starts being refused instead. The
- * repair is not optional and it is not deferred.
+ * That never cost this service an event, and only by an accident worth naming: no `devplatform.*`
+ * topic was registered, so `activity`'s ingest took the unregistered-topic branch and quarantined
+ * WITHOUT validating. `micro-contracts` `8889373` registered the two key topics, so that shelter is
+ * gone and every delivery on them is validated on arrival. The version was repaired before that
+ * happened, which is the only reason this reads as history.
  *
- * `actor` and `correlation_id` are the same defect wearing a third hat: both columns are nullable,
- * both went straight onto the wire, and the contract refuses either as null. See `buildEnvelope`.
+ * `actor` and `correlation_id` are the same defect wearing a third and fourth hat: both columns are
+ * nullable, both went straight onto the wire, and the contract refuses either as null. See
+ * `buildEnvelope`.
+ *
+ * And `actor` had a second fault of its own that the same shelter hid, found the day it was
+ * withdrawn: the value was well-formed but its KIND was not one the contract admits — `actorOf`
+ * spelled an API-key caller `key:<display>`, and the organisation-erasure path passed
+ * `system:identity` where `system` is the one kind that takes no subject. `DomainEvent.actor` is
+ * now the contract's `Actor` rather than `string`, so both are a compile error. That is the same
+ * repair `version` got, applied to the field that had quietly acquired the identical defect, and it
+ * is why this file imports two contract types rather than one.
  */
 
 import {
@@ -56,6 +68,7 @@ import {
   signDelivery,
   verifyDelivery,
   SIGNATURE_HEADER,
+  type Actor,
   type EventVersion,
 } from '@cloudsforge/contracts-events'
 import type { Sql, TransactionSql } from 'postgres'
@@ -95,7 +108,26 @@ export interface DomainEvent {
   /** Ordering is per `(topic, key)` only. Choose the aggregate id, never a timestamp. */
   readonly key: string
   readonly payload: Record<string, unknown>
-  readonly actor?: string
+  /**
+   * The contract's `Actor`, imported rather than restated — the same repair `version` already had,
+   * applied to the field that had quietly acquired the identical defect.
+   *
+   * This was `string`, and a `string` is what let two unspellable actors reach the wire and stay
+   * there. `server.ts:702` returned `` `key:${display}` `` for an API-key caller, and
+   * `server.ts:1575` passed `'system:identity'` from the organisation-erasure path. The contract
+   * admits `user`, `service`, `operator` and the BARE word `system` and nothing else
+   * (`parseActor`, `contracts/packages/events/src/index.ts:78`), so both were refused on arrival
+   * with `actor: unknown kind …` — the whole envelope discarded before any consumer read a
+   * payload, which is precisely how the integer `version` cost six producers every event they ever
+   * relayed.
+   *
+   * Typed, both are a `tsc --noEmit` error rather than a runtime refusal a consumer absorbs
+   * silently: `` `key:${string}` `` matches no member of the union, and `'system:identity'` is not
+   * the string literal `'system'`. That is `pnpm typecheck`, which is the build, which is CI. A
+   * runtime guard alone could not have done this — `topics.test.ts` built its envelope from one
+   * fixture row whose actor was a well-formed `user:…`, so it was green throughout.
+   */
+  readonly actor?: Actor
   readonly correlationId?: string
   readonly version?: number
 }
@@ -251,9 +283,16 @@ interface SubscriptionRow {
  *   - **`correlationId` falls back to the event id.** `makeEvent` does exactly this — "an event
  *     that starts a story rather than continuing one is its own correlation root".
  *   - **`actor` falls back to `service:devplatform`.** `emitKeyRevoked` is called with
- *     `'system:identity'` from the erasure path and with a caller subject from the route; an emit
+ *     `'service:identity'` from the erasure path and with a caller subject from the route; an emit
  *     with neither was this service acting on its own behalf, which is what `serviceActor` spells.
  *     `null` is not an actor the contract has a word for.
+ *
+ * The erasure path said `'system:identity'` until `micro-contracts` `8889373` registered
+ * `devplatform.key.revoked` and made it matter. `system` is the one kind the contract gives no
+ * subject to, so that string was refused as an unknown kind and the whole envelope discarded. The
+ * column is `string | null` here because it is read back out of Postgres and a database can hold
+ * anything; what goes IN is `DomainEvent.actor`, which is now the contract's `Actor` and cannot be
+ * written wrongly again.
  */
 export function buildEnvelope(row: OutboxRow): EventEnvelope {
   return {

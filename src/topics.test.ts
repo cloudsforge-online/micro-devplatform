@@ -15,12 +15,22 @@
  *      below: build an envelope with the relay's own `buildEnvelope` and hand it to the contract's
  *      own `classifyEnvelope`.
  *
- * NOTE that the registry names no `devplatform.*` topic at all, so every topic here is quarantined
- * and the envelope check would pass vacuously if the quarantine excused everything. It does not:
+ *   3. **The actor.** Added after `micro-contracts` `8889373` registered the two key topics and
+ *      withdrew the shelter the other two defects had lived under. `actorOf` spelled an API-key
+ *      caller `` `key:${display}` `` and the erasure path passed `'system:identity'`; neither is an
+ *      `ActorKind` the contract admits, so both were refused whole. The check below drives the real
+ *      emitters with every actor a real code path passes, rather than with one fixture.
+ *
+ * NOTE that the registry now names two `devplatform.*` topics — `devplatform.key.issued` and
+ * `devplatform.key.revoked` — and the other three are still quarantined. So the envelope check
+ * would pass vacuously for three of five if the quarantine excused everything. It does not:
  * `envelopeDefects excuses a lagging registry and nothing else` proves a real defect is still
- * reported on a quarantined topic — which matters more here than anywhere, because it is exactly
- * how the integer version stayed invisible: activity quarantines every unregistered topic, so
- * nothing ever validated one of these envelopes.
+ * reported on a quarantined topic.
+ *
+ * That distinction matters more here than anywhere, because being quarantined is exactly how the
+ * integer version stayed invisible: `activity` shelves every unregistered topic WITHOUT validating
+ * it, so nothing in the estate ever validated one of these envelopes. Whatever is still in the
+ * quarantine is still unvalidated in production, and this suite is the only thing looking at it.
  *
  * No database. Pure text, set arithmetic and one function call, so it runs in CI even when the
  * database-backed suite skips.
@@ -33,13 +43,18 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   SIGNATURE_HEADER,
+  TOPICS,
   TOPIC_NAMES,
+  classifyEnvelope,
   isRegisteredTopic,
+  parseActor,
   parseVersion,
   topicsProducedBy,
   verifyDelivery,
+  type Actor,
 } from '@cloudsforge/contracts-events'
-import { buildEnvelope, signEvent } from './outbox.ts'
+import { buildEnvelope, signEvent, type Emit } from './outbox.ts'
+import { emitKeyIssued, emitKeyRevoked } from './apikeys.ts'
 import {
   AWAITING_REGISTRATION,
   EMITTED_TOPICS,
@@ -142,12 +157,173 @@ test('a pending proposal disappears once contracts adopts it', () => {
     [],
     'the registry now names these — delete them from AWAITING_REGISTRATION',
   )
-  // The gap this quarantine describes: devplatform is a ProducerService that owns no registered
-  // topic, so every devplatform event reaches activity as `unclassified` — including
-  // `devplatform.key.revoked`, which 11:363 names as the estate's key-revocation propagation
-  // mechanism. Asserted rather than assumed, so the day contracts adopts one this file says so.
-  assert.equal(topicsProducedBy(SERVICE).length, 0)
-  assert.equal(Object.keys(AWAITING_REGISTRATION).length, EMITTED_TOPICS.length)
+  // Every emitted topic is accounted for EXACTLY once — registered or quarantined, never both and
+  // never neither. This replaces two counts (`topicsProducedBy(SERVICE).length === 0` and
+  // `AWAITING_REGISTRATION.length === EMITTED_TOPICS.length`) that held only while the registry
+  // owned no devplatform topic, and that a reader could have returned to green by adjusting a
+  // number. A partition cannot be satisfied by editing one side of it.
+  assert.deepEqual(
+    [...topicsProducedBy(SERVICE), ...Object.keys(AWAITING_REGISTRATION)].sort(),
+    [...EMITTED_TOPICS].sort(),
+    'an emitted topic is registered or quarantined — this says it is neither, or counted twice',
+  )
+  // And the split, pinned, so moving a topic across the line is a deliberate edit here.
+  // `devplatform.key.revoked` being on the registered side is the one that changes behaviour
+  // rather than tidiness: `11-data-and-contract-strategy.md:363` names it as the mechanism by
+  // which a revoked key stops working at every 30-second gateway cache in the estate, and until
+  // 8889373 no consumer could classify it, so that propagation path did not exist.
+  assert.deepEqual(topicsProducedBy(SERVICE), ['devplatform.key.issued', 'devplatform.key.revoked'])
+  assert.deepEqual(Object.keys(AWAITING_REGISTRATION).sort(), [
+    'devplatform.project.created',
+    'devplatform.quota.exceeded',
+    'devplatform.webhook_endpoint.created',
+  ])
+})
+
+/**
+ * The `custody` defect, asked from this side of the wire, for the two topics now registered.
+ *
+ * `keyedBy` is PROSE in the registry — a column name in a frozen object, not a type — so nothing
+ * in the contract can force an emit site to pass what it names. Both of custody's ceremony topics
+ * were registered `keyedBy: 'user_id'` while the emit sites passed the ADDRESS, and `activity`
+ * reads the envelope key AS the subject id, so every export was filed against a user that does not
+ * exist while every name check in the estate stayed green.
+ *
+ * `micro-contracts` checked this once, by reading these two emit sites while adopting the specs.
+ * That is a check with no expiry date: it cannot notice the emit site changing afterwards. This is
+ * the standing version.
+ */
+test('the key each registered topic is emitted with is the key the registry says it is', () => {
+  assert.equal(TOPICS['devplatform.key.issued'].keyedBy, 'key_id')
+  assert.equal(TOPICS['devplatform.key.revoked'].keyedBy, 'key_id')
+
+  const apikeys = readFileSync(join(SRC, 'apikeys.ts'), 'utf8').split('\n')
+  const emitters = apikeys
+    .map((line, index) => ({ line, at: index }))
+    .filter(({ line }) => /^export function emitKey(Issued|Revoked)\b/.test(line))
+  assert.equal(emitters.length, 2, 'apikeys.ts should export exactly emitKeyIssued and emitKeyRevoked')
+
+  for (const { line, at } of emitters) {
+    // The `key:` line of the emit call, which is the ordering partition and the id every consumer
+    // files the event against. `key.id` and nothing else — `key.lookupId` and `key.projectId` are
+    // both in scope in these bodies and both are the substitution custody made.
+    const body = apikeys.slice(at, at + 12)
+    const keyLine = body.find((text) => /^\s*key: /.test(text))
+    assert.ok(keyLine, `${line.trim()} has no key: line within its first 12 lines`)
+    assert.match(
+      keyLine,
+      /^\s*key: key\.id,?\s*$/,
+      `${line.trim()} passes something other than key.id, while the registry says key_id`,
+    )
+  }
+})
+
+/**
+ * Every actor these emitters really pass, through the real emitter and the real relay.
+ *
+ * ## The two defects this exists because of
+ *
+ * `Actor` admits `user:`, `service:`, `operator:` and the BARE word `system`
+ * (`contracts/packages/events/src/index.ts:78`). This service wrote two strings that are none of
+ * those, for the whole life of the service:
+ *
+ *   - `server.ts`'s `actorOf` returned `` `key:${display}` `` for an API-key caller — one of the
+ *     two principals the customer surface admits — so every event raised by a third-party
+ *     integration carried `actor: unknown kind "key"` and was refused whole.
+ *   - the organisation-erasure path passed `'system:identity'`, and `system` is the one kind that
+ *     takes no subject, so every revocation it announced was refused with
+ *     `actor: unknown kind "system"`.
+ *
+ * ## Why nothing caught them
+ *
+ * Two shelters, both now gone. `activity` quarantines an unregistered topic WITHOUT validating the
+ * envelope, and no `devplatform.*` topic was registered until `8889373`. And this suite built its
+ * envelope from ONE fixture row whose actor was a well-formed `user:…`, so the assertion that the
+ * relay's envelope is acceptable was answered by the fixture rather than by the service.
+ *
+ * ## Why this is a test and not only a type
+ *
+ * `DomainEvent.actor` is now the contract's `Actor`, which makes both defects a `tsc` error, and
+ * that is the stronger half. It is not the whole answer: `actor` reaches the wire from the
+ * `outbox.actor` COLUMN, and a column read is `string | null` however carefully it was written.
+ * This drives the real `emitKeyIssued`/`emitKeyRevoked`, takes the actor they really pass, sends it
+ * through the column's type and out through `buildEnvelope`, and asks the contract's own
+ * `classifyEnvelope`. Both `emitKeyRevoked` call sites appear here BY THEIR ACTOR, because a second
+ * caller sharing one payload builder is exactly where a shape drifts unnoticed — and it is the
+ * second caller that was broken.
+ */
+const KEY_FIXTURE = {
+  id: '018f0000-0000-7000-8000-0000000000d1',
+  projectId: '018f0000-0000-7000-8000-0000000000d2',
+  environmentId: '018f0000-0000-7000-8000-0000000000d3',
+  environment: 'live' as const,
+  serviceAccountId: null,
+  display: 'cfk_live_a1b2c3d4e5f6g7h8',
+  lookupId: 'a1b2c3d4e5f6g7h8',
+  name: 'ci',
+  scopes: ['devplatform.key.read'],
+  createdBy: 'user:018f0000-0000-7000-8000-0000000000c1',
+  createdAt: new Date('2026-08-03T09:00:00.000Z'),
+  lastUsedAt: null,
+  expiresAt: null,
+  revokedAt: new Date('2026-08-03T10:00:00.000Z'),
+  revokedReason: 'leaked in a gist',
+}
+
+/** Every actor a real code path in this service passes, and the site that passes it. */
+const REAL_ACTORS: readonly { readonly actor: Actor; readonly where: string }[] = [
+  // `actorOf` for a UserPrincipal — server.ts:701.
+  { actor: `user:${'018f0000-0000-7000-8000-0000000000c1'}`, where: 'actorOf, user caller' },
+  // `actorOf` for a KeyPrincipal — server.ts:701. Was `key:${display}`, refused by every consumer.
+  { actor: `service:${KEY_FIXTURE.display}`, where: 'actorOf, API-key caller' },
+  // The erasure path — server.ts:1574-1575. Was `system:identity`, refused by every consumer.
+  { actor: 'service:identity', where: 'identity.organisation.deleted handler' },
+  // The relay's own fallback when a row has no actor at all — outbox.ts `buildEnvelope`.
+  { actor: 'service:devplatform', where: 'buildEnvelope fallback' },
+]
+
+test('every actor this service really emits is one the contract accepts', () => {
+  for (const { actor, where } of REAL_ACTORS) {
+    const parsed = parseActor(actor)
+    assert.equal(parsed.ok, true, `${where} passes an actor the contract refuses: ${actor}`)
+  }
+})
+
+test('both emitKeyRevoked callers, and emitKeyIssued, build an envelope the contract accepts', () => {
+  for (const { actor, where } of REAL_ACTORS) {
+    const emitted: Parameters<Emit>[0][] = []
+    const collect: Emit = (event) => void emitted.push(event)
+
+    emitKeyIssued(collect, KEY_FIXTURE, actor)
+    emitKeyRevoked(collect, KEY_FIXTURE, actor)
+    assert.equal(emitted.length, 2, 'both emitters must produce exactly one event each')
+
+    for (const event of emitted) {
+      // The key is the aggregate the registry names, checked on the real emitted event rather than
+      // on the source text — the other half of the custody check above.
+      assert.equal(event.key, KEY_FIXTURE.id, `${event.topic} was keyed by something other than key.id`)
+      assert.equal(isRegisteredTopic(event.topic), true, `${event.topic} is no longer registered`)
+
+      // Through the COLUMN — `string | null`, which is what the database gives back — and out
+      // through the one function that builds an envelope. `emitInTx` (server.ts:1612) writes
+      // `event.actor ?? null` into exactly this column.
+      const envelope = buildEnvelope({
+        ...ROW,
+        topic: event.topic,
+        key: event.key,
+        actor: (event.actor ?? null) as string | null,
+        payload: event.payload,
+      })
+      const verdict = classifyEnvelope(JSON.parse(JSON.stringify(envelope)))
+      assert.deepEqual(
+        verdict.defects,
+        [],
+        `${where}: an event on ${event.topic} would be refused by every consumer — ${verdict.defects.join('; ')}`,
+      )
+      assert.equal(verdict.unregisteredTopic, null)
+      assert.equal(verdict.ok, true)
+    }
+  }
 })
 
 test('every pending proposal carries a spec that could be pasted into the registry', () => {
@@ -275,10 +451,50 @@ test('the delivery this relay signs is one a contract-following consumer verifie
  * by dead code while identity's own guard passes, because it scans literals rather than
  * reachability. This is the cheapest check that catches that exact shape.
  *
- * The detector is exercised on a fixture FIRST. A repository with no exported emitter would
- * otherwise get a green from a scan that finds nothing because it is broken, which is precisely
- * the "check that cannot fail" this estate keeps rediscovering.
+ * ## An import is not a call, and this used to think it was
+ *
+ * The scan below asks whether any line in `src/` mentions the symbol. An `import { emitFoo } from
+ * './foo.ts'` line mentions it, so a symbol that was imported and then never called read as
+ * reached. That is not hypothetical: deleting BOTH `emitKeyRevoked` call sites from `server.ts` and
+ * leaving its import left this suite fully green, with `devplatform.key.revoked` — the topic
+ * `11-data-and-contract-strategy.md:363` names as the estate's key-cache flush — produced by
+ * nothing at all. The check could not fail in exactly the case it was written for, because the
+ * import that survives a deleted call is the FIRST thing a reader would delete last.
+ *
+ * This is the same family as the defect it was written to catch: a scan that counts a MENTION as a
+ * USE. So imports and re-exports are stripped before the reference scan. Blank lines are left in
+ * their place, so line numbers in the declaration scan still name the real line.
+ *
+ * The detector is exercised on fixtures FIRST, including that exact case. A repository with no
+ * exported emitter would otherwise get a green from a scan that finds nothing because it is broken,
+ * which is precisely the "check that cannot fail" this estate keeps rediscovering — and it is not
+ * hypothetical here either: `micro-trade` carries this identical detector and declares no
+ * exported emitter at all, so there the fixtures are the ONLY thing exercising it.
  */
+function withoutImports(text: string): string {
+  const kept: string[] = []
+  let inDeclaration = false
+  for (const line of text.split('\n')) {
+    const trimmed = line.trimStart()
+    // `export { x } from './y.ts'` re-exports a symbol without using it, exactly as an import does.
+    const opens = !inDeclaration && /^(?:import\b|export\s*\{[^}]*$|export\s*\{[^}]*\}\s*from\b)/.test(trimmed)
+    if (opens) {
+      // A bare `import './x.ts'` and a one-line `import { a } from './x.ts'` both close at once; a
+      // braced list spread over several lines closes at the `from '…'`.
+      inDeclaration = !/\bfrom\s+['"]/.test(line) && !/^import\s+['"]/.test(trimmed)
+      kept.push('')
+      continue
+    }
+    if (inDeclaration) {
+      if (/\bfrom\s+['"]/.test(line)) inDeclaration = false
+      kept.push('')
+      continue
+    }
+    kept.push(line)
+  }
+  return kept.join('\n')
+}
+
 function unreachedEmitters(files: readonly { name: string; text: string }[]): readonly string[] {
   const declared: { symbol: string; where: string }[] = []
   for (const file of files) {
@@ -287,10 +503,11 @@ function unreachedEmitters(files: readonly { name: string; text: string }[]): re
       if (match?.[1]) declared.push({ symbol: match[1], where: `${file.name}:${index + 1}` })
     })
   }
+  const bodies = files.map((file) => ({ name: file.name, text: withoutImports(file.text) }))
   return declared
     .filter(({ symbol }) => {
       const reference = new RegExp(`\\b${symbol}\\b`)
-      for (const file of files) {
+      for (const file of bodies) {
         for (const line of file.text.split('\n')) {
           const trimmed = line.trimStart()
           if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue
@@ -315,6 +532,51 @@ test('the unreachable-emitter detector can actually fail', () => {
     { name: 'server.ts', text: 'emitSessionRevoked()\n' },
   ]
   assert.deepEqual(unreachedEmitters(alive), [])
+})
+
+/**
+ * The case the detector used to get wrong, and the reason it is worth having at all.
+ *
+ * A dead emitter is almost never dead by having its import removed too — a call is deleted or
+ * refactored away and the import is what lingers. Counting that import as a reference made this
+ * check green in precisely the situation it exists for.
+ */
+test('an emitter that is imported but never called is NOT reached', () => {
+  const importedOnly = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    {
+      name: 'server.ts',
+      text: "import { emitKeyRevoked, revokeApiKey } from './apikeys.ts'\nrevokeApiKey()\n",
+    },
+  ]
+  assert.deepEqual(unreachedEmitters(importedOnly), ['emitKeyRevoked (apikeys.ts:1)'])
+
+  // The multi-line form, which is how every import in this service is actually written.
+  const multiline = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    {
+      name: 'server.ts',
+      text: "import {\n  emitKeyRevoked,\n  revokeApiKey,\n} from './apikeys.ts'\nrevokeApiKey()\n",
+    },
+  ]
+  assert.deepEqual(unreachedEmitters(multiline), ['emitKeyRevoked (apikeys.ts:1)'])
+
+  // A re-export is not a use either.
+  const reExported = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    { name: 'index.ts', text: "export { emitKeyRevoked } from './apikeys.ts'\n" },
+  ]
+  assert.deepEqual(unreachedEmitters(reExported), ['emitKeyRevoked (apikeys.ts:1)'])
+
+  // And stripping imports must not blind it to the call that FOLLOWS one.
+  const importedAndCalled = [
+    { name: 'apikeys.ts', text: 'export function emitKeyRevoked(): void {}\n' },
+    {
+      name: 'server.ts',
+      text: "import {\n  emitKeyRevoked,\n} from './apikeys.ts'\nemitKeyRevoked()\n",
+    },
+  ]
+  assert.deepEqual(unreachedEmitters(importedAndCalled), [])
 })
 
 test('every exported emitter is reached from somewhere', () => {

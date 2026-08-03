@@ -97,6 +97,7 @@ import {
 import { ForbiddenError, TokenError, bearerFrom, statusFor, type Principal } from '@cloudsforge/auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
+import type { Actor } from '@cloudsforge/contracts-events'
 import { SIGNATURE_HEADER, withInbox, withOutbox, type Db, type Emit, type Tx } from './outbox.ts'
 import {
   IdempotencyInFlightError,
@@ -666,8 +667,39 @@ async function roleInOrg(
   return deps.membership.roleFor(caller.token, org.identityOrgId, caller.userId)
 }
 
-function actorOf(caller: CallerPrincipal): string {
-  return caller.kind === 'user' ? `user:${caller.userId}` : `key:${caller.key.display}`
+/**
+ * Who did this, in the ONE vocabulary the estate has for that question.
+ *
+ * The return type is the contract's `Actor` rather than `string`, and that is the whole repair.
+ * This function used to spell an API-key caller `` `key:${caller.key.display}` ``, and `key` is not
+ * an `ActorKind`: the contract admits `user`, `service`, `operator` and the bare word `system`
+ * (`parseActor`, `contracts/packages/events/src/index.ts:78`) and answers anything else with
+ * `actor: unknown kind "key"`. Every event this function's result reached — a project created, a
+ * key issued, a key revoked, a webhook endpoint registered — was therefore an envelope every
+ * consumer in the estate refuses, whenever the caller authenticated with a key rather than a
+ * session. `KeyPrincipal` is not a corner: it is one of the two principals the customer surface
+ * admits, and third-party integrations are the reason this service exists.
+ *
+ * It survived because `activity` takes its unregistered-topic branch for a topic it cannot
+ * classify and quarantines WITHOUT validating the envelope, and no `devplatform.*` topic was
+ * registered. `micro-contracts` `8889373` registered `devplatform.key.issued` and
+ * `devplatform.key.revoked`, so those two are now validated on arrival and this became live.
+ *
+ * `service:` is the kind, matching `billing/src/server.ts:660`, `custody/src/server.ts:802`,
+ * `market/src/server.ts:1493` and `beacon/src/server.ts:910`, every one of which maps its non-user
+ * principal to `service:`. devplatform was the only service in the estate that invented a fifth
+ * kind. The subject stays `key.display` and not `key.id`: the display is the identifier an operator
+ * actually finds in a log line (`apikeys.ts`, `revokeByDisplay`), it is not secret, and an actor
+ * nobody can trace back to a credential is the reason to have the field at all.
+ *
+ * The same vocabulary reaches `api_keys.created_by` and `api_keys.revoked_by` through here, and
+ * that is deliberate rather than incidental — `Actor`'s own documentation requires it ("an event
+ * and the ledger entry it accompanies must attribute a change identically, or reconciling 'who
+ * moved this money' means reconciling two spellings first"). Fixing only the wire would have
+ * created exactly the two spellings that warning is about.
+ */
+function actorOf(caller: CallerPrincipal): Actor {
+  return caller.kind === 'user' ? `user:${caller.userId}` : `service:${caller.key.display}`
 }
 
 /* ------------------------------------------------------------------ routes */
@@ -908,7 +940,9 @@ function buildRoutes(): Route[] {
             },
           )
           minted = issued.secretKey
-          emitKeyIssued(emit, issued.key)
+          // The same `actorOf(caller)` written to `created_by` above, passed rather than read back
+          // off the row: a column round-trip turns a proven `Actor` into an unproven `string`.
+          emitKeyIssued(emit, issued.key, actorOf(caller))
           deps.metrics.increment('devplatform_keys_issued_total', { environment })
           return { response: { key: issued.key }, artefactId: issued.key.id }
         },
@@ -1523,8 +1557,22 @@ function buildRoutes(): Route[] {
           const org = await findOrgByIdentityId(tx, identityOrgId!)
           if (!org) return { revoked: 0, suspended: false }
           await setOrgStatus(tx, org.id, 'suspended')
-          const revoked = await revokeOrgKeys(tx, org.id, 'system:identity', 'organisation deleted')
-          for (const key of revoked) emitKeyRevoked((event) => void emitInTx(tx, deps.producer, event), key, 'system:identity')
+          // `service:identity`, NOT `system:identity`. `system` is the one actor kind that takes no
+          // subject — `parseActor` matches the bare word and then refuses `system:` as an unknown
+          // kind (`contracts/packages/events/src/index.ts:79`) — so every event this path emitted
+          // was an envelope the estate refuses with `actor: unknown kind "system"`. It was
+          // invisible while `devplatform.key.revoked` was unregistered, because `activity`
+          // quarantines an unclassifiable topic without validating; `micro-contracts` `8889373`
+          // registered it, so this path was the next org deletion away from silently dropping
+          // every revocation notice the estate depends on to flush its key caches.
+          //
+          // `service:identity` rather than bare `system` because the subject is worth keeping:
+          // this is the identity service acting, and an operator asking why a live customer's keys
+          // were revoked at 03:00 needs the answer to name it. `revoked_by` takes the same string
+          // for the reason `Actor` gives — the row and the event must attribute a change
+          // identically, or reconciling them means reconciling two spellings first.
+          const revoked = await revokeOrgKeys(tx, org.id, 'service:identity', 'organisation deleted')
+          for (const key of revoked) emitKeyRevoked((event) => void emitInTx(tx, deps.producer, event), key, 'service:identity')
           return { revoked: revoked.length, suspended: true }
         })
         if (outcome.status === 'processed' && outcome.value.revoked > 0) {

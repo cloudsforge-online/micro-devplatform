@@ -24,6 +24,7 @@
  * with nowhere to put a key.
  */
 
+import type { Actor } from '@cloudsforge/contracts-events'
 import type { Db, Emit, Tx } from './outbox.ts'
 import { TOPICS } from './outbox.ts'
 import type { KeyEnvironment } from './keys.ts'
@@ -328,7 +329,7 @@ export async function findEnvironment(
 }
 
 /** Announce a project. The caller holds the transaction; this is the event that goes with it. */
-export function emitProjectCreated(emit: Emit, project: Project, actor: string): void {
+export function emitProjectCreated(emit: Emit, project: Project, actor: Actor): void {
   emit({
     topic: TOPICS.projectCreated,
     key: project.id,

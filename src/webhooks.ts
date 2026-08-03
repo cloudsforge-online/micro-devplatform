@@ -44,6 +44,7 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import type { HttpClient } from '@cloudsforge/http'
+import type { Actor } from '@cloudsforge/contracts-events'
 import type { Db, Emit, EventEnvelope, Tx } from './outbox.ts'
 import { TOPICS, signEvent, verifyEventSignature } from './outbox.ts'
 import { NotFoundError, ValidationError } from './orgs.ts'
@@ -180,7 +181,7 @@ export async function createEndpoint(tx: Tx, input: CreateEndpointInput): Promis
   return { endpoint: toEndpoint(row), secret }
 }
 
-export function emitEndpointCreated(emit: Emit, endpoint: WebhookEndpoint, actor: string): void {
+export function emitEndpointCreated(emit: Emit, endpoint: WebhookEndpoint, actor: Actor): void {
   emit({
     topic: TOPICS.webhookEndpointCreated,
     key: endpoint.id,

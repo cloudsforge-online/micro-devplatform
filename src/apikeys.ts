@@ -31,6 +31,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import type { Actor } from '@cloudsforge/contracts-events'
 import type { Db, Emit, Tx } from './outbox.ts'
 import { TOPICS } from './outbox.ts'
 import { NotFoundError, ValidationError } from './orgs.ts'
@@ -268,12 +269,22 @@ export async function issueApiKey(
   return { key: toSummary(row), secretKey: minted.secretKey }
 }
 
-/** The event that goes with an issuance. Carries the DISPLAY, never the key. */
-export function emitKeyIssued(emit: Emit, key: ApiKeySummary): void {
+/**
+ * The event that goes with an issuance. Carries the DISPLAY, never the key.
+ *
+ * `actor` is a parameter of the contract's `Actor` type rather than `key.createdBy`, and the
+ * difference is not style. `createdBy` is `string` because it is read back out of Postgres, and a
+ * column read is where a type guarantee is laundered: whatever the compiler proved about the value
+ * on its way IN is gone by the time it comes back OUT. Taking it from the caller keeps the one
+ * value the compiler can still vouch for. The two are the same string — `server.ts` passes
+ * `actorOf(caller)` to both `issueApiKey`'s `createdBy` and to here — so this changes what is
+ * PROVEN, not what is emitted.
+ */
+export function emitKeyIssued(emit: Emit, key: ApiKeySummary, actor: Actor): void {
   emit({
     topic: TOPICS.keyIssued,
     key: key.id,
-    actor: key.createdBy,
+    actor,
     payload: {
       keyId: key.id,
       projectId: key.projectId,
@@ -354,7 +365,7 @@ export async function revokeByDisplay(
   return revokeApiKey(tx, { ...input, id: row.id })
 }
 
-export function emitKeyRevoked(emit: Emit, key: ApiKeySummary, actor: string): void {
+export function emitKeyRevoked(emit: Emit, key: ApiKeySummary, actor: Actor): void {
   emit({
     topic: TOPICS.keyRevoked,
     key: key.id,

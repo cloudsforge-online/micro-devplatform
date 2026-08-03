@@ -32,24 +32,44 @@
  *      a real envelope through the relay's own `buildEnvelope` and hands it to the contract's own
  *      `classifyEnvelope`.
  *
- * ## Nothing this service emits is registered, and one of the five is load-bearing
+ * ## Two of the five are now registered, and they are the two that were load-bearing
  *
- * `devplatform` IS a valid `ProducerService` in the contract's union and owns **zero** topics in
- * `TOPICS`. All five below therefore sit in the quarantine, each carrying the exact `TopicSpec`
- * `micro-contracts` should paste.
+ * `devplatform` IS a valid `ProducerService` in the contract's union and, as of `micro-contracts`
+ * `8889373`, owns two topics in `TOPICS`: **`devplatform.key.issued`** and
+ * **`devplatform.key.revoked`**, adopted verbatim from the entries that used to sit below. The
+ * other three are still quarantined, each carrying the exact `TopicSpec` `micro-contracts` should
+ * paste.
  *
- * `devplatform.key.revoked` is the one that is not merely tidiness.
+ * `devplatform.key.revoked` is the one that was never merely tidiness.
  * `11-data-and-contract-strategy.md:363` says key validation is cached 30 s by the gateway and
  * that "revocation propagates via `devplatform.key.revoked`" — so that topic IS the mechanism by
- * which a revoked API key stops working everywhere rather than only here. A topic no registry
- * names is a topic no consumer can classify, which means the documented propagation path does not
- * exist. Revocation is still immediate in THIS service; it is immediate nowhere else.
+ * which a revoked API key stops working everywhere rather than only here. While no registry named
+ * it, no consumer could classify it, so the documented propagation path did not exist: revocation
+ * was immediate in THIS service and immediate nowhere else. Registration is what builds it.
  *
- * Note also what saved this repository from the version defect and will stop saving it:
- * `activity`'s ingest takes its unregistered-topic branch for every `devplatform.*` event and
- * quarantines rather than validating, so the integer version was never the thing that refused
- * them. Register `devplatform.key.revoked` without fixing the envelope and every delivery starts
- * being refused instead. Both halves landed together.
+ * ## What registration took away, and what it then found
+ *
+ * `activity`'s ingest takes its unregistered-topic branch for a topic it cannot classify and
+ * quarantines **without validating the envelope**. Every `devplatform.*` topic was unregistered, so
+ * for the whole life of this service an envelope defect here cost nothing — the events were shelved
+ * for being unnameable long before anything looked at their contents. That is what hid the integer
+ * `version`, and it is what hid the two `actor` defects found the day it was withdrawn:
+ *
+ *   - `server.ts`'s `actorOf` spelled an API-key caller `` `key:${display}` ``. `key` is not an
+ *     `ActorKind` — the contract admits `user`, `service`, `operator` and the bare word `system`
+ *     (`parseActor`, `contracts/packages/events/src/index.ts:78`) — so every event raised by a
+ *     third-party integration was refused whole with `actor: unknown kind "key"`. A `KeyPrincipal`
+ *     is not a corner case: it is one of the two principals the customer surface admits.
+ *   - the `identity.organisation.deleted` handler passed `'system:identity'`. `system` is the one
+ *     kind that takes NO subject, so every revocation that path announced — the mass revocation
+ *     that follows an organisation being erased, which is precisely when a cache flush matters most
+ *     — was refused with `actor: unknown kind "system"`.
+ *
+ * Both are repaired, and repaired the way `version` was rather than by correcting two strings:
+ * `DomainEvent.actor` is now the contract's `Actor`, imported rather than restated, so each is a
+ * `tsc --noEmit` error and neither can be written again. `topics.test.ts` carries the runtime half,
+ * because `actor` reaches the wire from a COLUMN and a column read is `string | null` however
+ * carefully it was written.
  */
 
 import {
@@ -97,29 +117,24 @@ export interface ProposedTopic {
  * partition, so it is contract rather than a producer's private preference.
  */
 export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Object.freeze({
-  'devplatform.key.revoked': {
-    reason:
-      '11-data-and-contract-strategy.md:363 names THIS TOPIC as the mechanism by which a revoked API key stops working at every 30-second gateway cache in the estate. Unregistered, no consumer can classify it, so the documented propagation path does not exist and revocation is immediate only inside this service.',
-    spec: {
-      producer: 'devplatform',
-      payloadType: 'ApiKeyRevoked',
-      version: '1.0',
-      keyedBy: 'key_id',
-      description:
-        'An API key was revoked. Every cache holding a verification result for it must drop it.',
-    },
-  },
-  'devplatform.key.issued': {
-    reason:
-      "The other half of revoked, and a key issued by somebody other than its owner is the first thing a compromise looks like. Nothing can tell the owner today.",
-    spec: {
-      producer: 'devplatform',
-      payloadType: 'ApiKeyIssued',
-      version: '1.0',
-      keyedBy: 'key_id',
-      description: 'An API key was issued for a project, with its scopes and prefix.',
-    },
-  },
+  // `devplatform.key.revoked` and `devplatform.key.issued` were here until contracts-events
+  // registered them (micro-contracts 8889373, adopted verbatim: `keyedBy: 'key_id'` on both).
+  // Deleted rather than annotated, because `adoptedProposals()` fails while an adopted entry is
+  // present and that failure IS the self-emptying quarantine.
+  //
+  // Registering `key.revoked` is what finally builds the propagation path
+  // `11-data-and-contract-strategy.md:363` describes — a revoked key ceasing to work at every
+  // 30-second gateway cache rather than only inside this service. It also removed this service's
+  // last hiding place: `activity` quarantined every unregistered `devplatform.*` topic WITHOUT
+  // validating the envelope, so an envelope defect on these two cost nothing. It costs everything
+  // now. That is how the two `actor` defects below were found, on the day the shelter was removed:
+  //
+  //   - `server.ts:702` spelled an API-key caller `key:<display>`, and `key` is not an `ActorKind`.
+  //   - `server.ts:1574-1575` spelled the erasure path `system:identity`, and `system` is the one
+  //     kind that takes NO subject (`parseActor`, contracts index.ts:79).
+  //
+  // Both are fixed, and `DomainEvent.actor` is now the contract's `Actor` type so neither spelling
+  // can be written again — the same trick `version` already used. See `outbox.ts`.
   'devplatform.project.created': {
     reason:
       'A project is the unit everything else in this service hangs off. billing and analytics both have a reason to hear it and neither can today.',
@@ -168,9 +183,11 @@ export function undeclaredTopics(emitted: readonly string[]): readonly string[] 
  * Registry topics this service owns and never emits — a feature that can never fire.
  *
  * The direction that is easiest to miss, because nothing breaks and nothing logs: consumers
- * classify the topic, the code path renders it, and nothing ever arrives. Empty today only
- * because the registry owns no devplatform topic at all, which is the gap the quarantine
- * describes.
+ * classify the topic, the code path renders it, and nothing ever arrives. It used to be empty
+ * vacuously — the registry owned no devplatform topic, so there was nothing for it to find. Since
+ * `8889373` it is a real check with two topics to answer for: delete or rename either `apikeys.ts`
+ * emitter and this returns it, naming a consumer that would wait for ever. For
+ * `devplatform.key.revoked` that consumer is every key cache in the estate.
  */
 export function unemittedOwnedTopics(emitted: readonly string[]): readonly TopicName[] {
   const seen = new Set(emitted)
