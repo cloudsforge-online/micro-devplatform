@@ -4,6 +4,8 @@ The developer platform. Developer organisations, projects, environments, **API k
 accounts, OAuth clients, webhook endpoints and secrets, usage, quotas, and the application
 directory.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 It is the service that issues the credential a third party presents to the CloudsForge public API.
 Everything else here is bookkeeping around that one thing.
 
@@ -111,7 +113,7 @@ rather than merely asserted: a credential can exist and authorise nothing. It ca
 
 ## 2. The whoami: `GET /v1/keys/self`
 
-[18-build-status](../docs/ecosystem/18-build-status.md) §3.3d(4) records the finding:
+[18-build-status](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/18-build-status.md) §3.3d(4) records the finding:
 
 > **A machine credential has no whoami.** `identity/src/server.ts:540` refuses a service token on
 > `GET /auth/me`, so a devplatform API key will have no way to ask what it is.
@@ -466,7 +468,7 @@ bearer token** to `GET /organisations/:id/memberships` (`identity/src/server.ts:
 service holds no credential that can read anybody's membership.
 
 A mirrored membership table would be stale at exactly the moment someone is removed from a company,
-and [11-data-and-contract-strategy](../docs/ecosystem/11-data-and-contract-strategy.md):349 prices
+and [11-data-and-contract-strategy](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/11-data-and-contract-strategy.md):349 prices
 the staleness this estate accepts for identity data at 60 seconds. Sixty seconds is fine for
 rendering a list. It is not fine for deciding who may **mint a credential**.
 
@@ -677,14 +679,14 @@ Each is in another repository and out of this one's scope.
    `contracts/packages/events/src/index.ts:222` freezes `TOPICS` and `:351` closes `TopicName`;
    `devplatform` is a legal `ProducerService` (`:194`) but has no topic of its own. So
    `devplatform.key.revoked` — which
-   [11-data-and-contract-strategy](../docs/ecosystem/11-data-and-contract-strategy.md):363 names by
+   [11-data-and-contract-strategy](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/11-data-and-contract-strategy.md):363 names by
    string as the mechanism that propagates a revocation past the gateway's 30-second validation cache
    — cannot be constructed through `makeEvent`. The five topics are local constants in `outbox.ts`,
    validated with `isValidTopicName` (the shape check, which they pass) rather than
    `isRegisteredTopic` (which they cannot until the package adds them).
 
 3. **`@cloudsforge/contracts-devplatform` has not been cut.** 18 §3.5(4) lists it among the four
-   uncut packages, and [11](../docs/ecosystem/11-data-and-contract-strategy.md):54 names it as the
+   uncut packages, and [11](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/11-data-and-contract-strategy.md):54 names it as the
    owner of the scope vocabulary. Until it exists the vocabulary is `src/scopes.ts`, and moving it is
    a package extraction rather than a redesign.
 
@@ -754,3 +756,10 @@ each in full; this is the ledger, with what else turned up while fixing them.
    `billing`-role member can therefore read a project's limits, which is right, but there is no
    route that answers "what is the ceiling?" other than the `ceiling` field this change adds to the
    `PUT` response. A console rendering a slider has to make one write to learn the range.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
