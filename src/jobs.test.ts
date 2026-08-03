@@ -255,9 +255,13 @@ test('jobs', { skip }, async (t) => {
       key: 'k',
       occurredAt: new Date().toISOString(),
       producer: 'devplatform',
-      version: 1,
-      actor: null,
-      correlationId: null,
+      // The wire shape the CONTRACT demands, not the one the relay used to build. `version: 1`,
+      // `actor: null` and `correlationId: null` compiled here for the whole life of this file and
+      // are all three refused by `validateEnvelope` — a fixture reproducing the defect is a
+      // fixture that certifies it.
+      version: '1.0',
+      actor: 'service:devplatform',
+      correlationId: 'req-test',
       payload: {},
     }
     await enqueueDeliveries(store, envelope)
@@ -297,9 +301,9 @@ test('jobs', { skip }, async (t) => {
         key: 'k',
         occurredAt: new Date().toISOString(),
         producer: 'devplatform',
-        version: 1,
-        actor: null,
-        correlationId: null,
+        version: '1.0',
+        actor: 'service:devplatform',
+        correlationId: 'req-test',
         payload: {},
       })
     }

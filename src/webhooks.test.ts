@@ -338,9 +338,12 @@ test('webhooks', { skip }, async (t) => {
       key: 'k',
       occurredAt: new Date().toISOString(),
       producer: 'devplatform',
-      version: 1,
-      actor: null,
-      correlationId: null,
+      // The wire shape the CONTRACT demands. `version: 1` with null actor and correlation id
+      // compiled here for the whole life of this file and is refused by `validateEnvelope` three
+      // times over — a fixture reproducing a defect is a fixture that certifies it.
+      version: '1.0',
+      actor: 'service:devplatform',
+      correlationId: 'req-test',
       payload: { hello: 'world' },
     }
   }
