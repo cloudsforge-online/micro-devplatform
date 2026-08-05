@@ -36,17 +36,25 @@ jobs:
       port: 4000
       # The image startup smoke test boots the real service, and `env.ts` validates its configuration
       # at import — so the container needs the variables it declares, not just a database, or it
-      # exits before it serves /livez. These are CI-only NON-secrets: throwaway values that only have
-      # to clear a length and placeholder check, and a JWKS URL that is never dialled because /livez
-      # needs no identity. Never a real credential.
+      # exits before it serves /livez. The identity URLs are CI-only NON-secrets, never dialled
+      # because /livez needs no identity, and never a real credential.
+      #
+      # THE TWO OUTBOX-FAMILY VARIABLES ARE NOT THROWAWAY ANY MORE, and the value they used to carry
+      # is why. `ci-only-not-a-real-secret-…` "only had to clear a length and placeholder check" —
+      # which is word for word the property that let `estate-only-outbox-secret-…` sit on 54 lines of
+      # a PUBLIC compose file and pass every guard in the estate (micro-org #142). The boot guard now
+      # checks the SHAPE and has no CI exemption, so `@generate` asks service-ci.yml for a fresh
+      # `openssl rand -base64 48`: CI holds a real secret rather than a string claiming to be one.
+      # Each line gets its OWN value, which is what keeps proving the ingest list and the signing
+      # scalar are separate variables rather than one read twice.
       #
       # Note what is NOT here: there is no DEVPLATFORM_ADMIN_TOKEN to supply, because this service
       # has no break-glass credential and no reveal switch. `env.test.ts` asserts that by name.
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        DEVPLATFORM_INGEST_SECRETS=ci-only-not-a-real-secret-00000000
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-11111111
+        DEVPLATFORM_INGEST_SECRETS=@generate
+        OUTBOX_SIGNING_SECRET=@generate
     secrets:
       # @cloudsforge/* is resolved by link:../runtime and link:../contracts, so CI checks out
       # micro-runtime and micro-contracts as siblings — both private, so the workflow needs a

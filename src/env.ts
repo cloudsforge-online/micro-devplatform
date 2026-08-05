@@ -29,6 +29,7 @@
  */
 
 import { hostname } from 'node:os'
+import { assertGeneratedSecret, assertGeneratedSecretList } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -45,18 +46,6 @@ export class EnvError extends Error {
   }
 }
 
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'change_me',
-  'placeholder',
-  'secret',
-  'token',
-  'dev-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
-
 type Source = Readonly<Record<string, string | undefined>>
 
 function required(source: Source, name: string): string {
@@ -65,16 +54,39 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * The estate's shared event-bus HMAC key, held to a SHAPE rather than to a deny-list.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE LOCAL `requiredSecret` AND ITS `PLACEHOLDERS` SET USED TO LIVE HERE, AND THEY ARE GONE
+ * RATHER THAN KEPT IN FRONT OF THIS.**
+ *
+ * They refused a fixed list of exact strings plus anything under 24 characters. The value that sat
+ * on 54 lines of a PUBLIC compose file — `estate-only-outbox-secret-00000000000000` — was on no
+ * list and was 40 characters, so it passed here and in every other service in the estate
+ * (micro-org #142). A check that could not fail read as the absence of a problem, which is worse
+ * than no check at all.
+ *
+ * A deny-list of exact strings cannot work: the next placeholder somebody writes is, by definition,
+ * not on it. `assertGeneratedSecret` asserts what a placeholder cannot have — the base64 or hex
+ * alphabet (no hyphens; every placeholder this estate wrote had one), 32 decoded BYTES rather than
+ * 24 keystrokes, and a measured Shannon entropy floor. Every string the old set held is refused by
+ * that, so nothing is lost by deleting it, and keeping it would leave a weaker rule for the next
+ * variable to reach for.
+ *
+ * `required` rather than a length check first, deliberately: the weaker checks are a strict subset
+ * of the stronger ones, and running them first would answer a 40-character placeholder with "must
+ * be at least 24 characters" — true, useless, and pointing the operator at the wrong property.
+ *
+ * There is no NODE_ENV exemption and no escape hatch, so CI generates a real value per run rather
+ * than being let through. It throws `SecretError` rather than `EnvError`, which is deliberate: the
+ * class says a value failed the SHAPE check rather than this file's own parsing, and `fatalConfig`
+ * below reads `err.message` off `unknown`, so the boot line is identical either way.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. Set above the point at which a
-  // human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  assertGeneratedSecret(name, value)
   return value
 }
 
@@ -99,6 +111,16 @@ function integer(source: Source, name: string, fallback: number, min: number, ma
  * A LIST, not a value, because rotation without an overlap window means every producer must
  * change secret in the same instant as this service does, and that instant does not exist during
  * a rolling deploy. The same shape as `activity`'s `ACTIVITY_INGEST_SECRETS`.
+ *
+ * **Every entry faces exactly the bar a single secret faces — `assertGeneratedSecretList` is
+ * `assertGeneratedSecret` per entry, and there is no weaker rule for the outgoing key.** In a
+ * rotation overlap window the outgoing key is the one an attacker already holds if it leaked, and
+ * "just for the drain" is exactly how a placeholder survives the rotation meant to remove it.
+ *
+ * The local placeholder and length loop that used to sit here went with `requiredSecret`, for the
+ * reason recorded above it. What is kept is what the shape check does not know about: the
+ * empty-list refusal, whose message names this service's own variable, and the duplicate refusal
+ * below.
  */
 export function parseSecretList(raw: string, name: string): readonly string[] {
   const entries = raw
@@ -106,14 +128,7 @@ export function parseSecretList(raw: string, name: string): readonly string[] {
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0)
   if (entries.length === 0) throw new EnvError(`${name} is required — at least one secret`)
-  for (const entry of entries) {
-    if (PLACEHOLDERS.has(entry.toLowerCase())) {
-      throw new EnvError(`${name} contains a known placeholder — generate real secrets`)
-    }
-    if (entry.length < 24) {
-      throw new EnvError(`${name} entries must each be at least 24 characters`)
-    }
-  }
+  assertGeneratedSecretList(name, entries)
   if (new Set(entries).size !== entries.length) {
     // A duplicated secret in the list makes the "which key verified this" answer ambiguous, and
     // that answer is what tells an operator whether a rotation has finished.
@@ -205,7 +220,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
 
     ingestSecrets: parseSecretList(required(source, 'DEVPLATFORM_INGEST_SECRETS'), 'DEVPLATFORM_INGEST_SECRETS'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret: requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET'),
 
     defaultQuotaPerMinute: integer(source, 'DEVPLATFORM_DEFAULT_QUOTA_PER_MINUTE', 600, 1, 10_000_000),
     defaultQuotaPerMonth: integer(source, 'DEVPLATFORM_DEFAULT_QUOTA_PER_MONTH', 1_000_000, 1, 10_000_000_000),

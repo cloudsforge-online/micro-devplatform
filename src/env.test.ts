@@ -10,9 +10,21 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-const GOOD_SECRET = 'a-real-looking-secret-value-0000'
-const SECOND_SECRET = 'another-real-looking-secret-1111'
+import { SecretError } from '@cloudsforge/secrets'
+
+/**
+ * GENERATED, not written.
+ *
+ * Both of these used to be memorable strings — `a-real-looking-secret-value-0000` and
+ * `another-real-looking-secret-1111` — long enough to clear the old 24-character floor and on no
+ * deny-list. That is exactly the shape of `estate-only-outbox-secret-00000000000000`, which sat on
+ * 54 lines of a PUBLIC compose file and passed every guard in the estate (micro-org #142). A
+ * fixture exempt from the rule it exercises is how that survived every test in the estate.
+ */
+const GOOD_SECRET = randomBytes(48).toString('base64')
+const SECOND_SECRET = randomBytes(48).toString('base64')
 
 function base(): Record<string, string> {
   return {
@@ -97,19 +109,102 @@ test('a known placeholder does not boot', () => {
   // `.env.example` ships CHANGE_ME, and CHANGE_ME must not start. A default secret in source is not
   // convenient, it is catastrophic, and a placeholder that boots is a placeholder that reaches
   // production.
+  //
+  // `SecretError` rather than this file's `EnvError`: the class says a value failed the SHAPE check
+  // rather than this file's own parsing, and `fatalConfig` reads `err.message` off `unknown`, so
+  // the boot line an operator sees is identical either way.
   for (const placeholder of ['CHANGE_ME', 'change-me', 'changeme', 'secret', 'placeholder']) {
     assert.throws(
       () => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: placeholder }),
-      EnvError,
+      SecretError,
       `${placeholder} was accepted as a signing secret`,
     )
   }
 })
 
-test('a short secret does not boot, whatever it says', () => {
-  assert.throws(() => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'hunter2' }), EnvError)
-  assert.throws(() => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'x'.repeat(23) }), EnvError)
-  assert.doesNotThrow(() => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'x'.repeat(24) }))
+test('THE UNIT IS BYTES OF KEY MATERIAL, and 24 keystrokes is not 32 bytes', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  // The last line of this test used to read:
+  //
+  //     assert.doesNotThrow(() => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'x'.repeat(24) }))
+  //
+  // Twenty-four identical characters, asserted to BOOT. That is the whole of micro-org #142 in one
+  // line: the old floor counted keystrokes, so a value with no entropy at all was not merely
+  // tolerated, it was pinned by a test as correct. `x`x24 now fails on two counts — 18 decoded
+  // bytes, and zero bits of entropy per character.
+  // ══════════════════════════════════════════════════════════════════════════════════════════
+  assert.throws(() => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'hunter2' }), SecretError)
+  assert.throws(() => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'x'.repeat(23) }), SecretError)
+  assert.throws(() => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'x'.repeat(24) }), SecretError)
+  // Long enough in characters and in bytes, and still degenerate. Entropy is what catches it.
+  assert.throws(
+    () => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: 'x'.repeat(64) }),
+    /entropy is 0.00 bits per character/,
+  )
+  // And a generated value in either alphabet is accepted, so the floors do not refuse correct
+  // input — a guard that occasionally rejects the right answer is a guard somebody removes.
+  assert.doesNotThrow(() =>
+    loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64') }),
+  )
+  assert.doesNotThrow(() =>
+    loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: randomBytes(32).toString('hex') }),
+  )
+})
+
+/* ────────────────────────────────────────────────────────────────────────────────────────────────
+ * micro-org #142. The shape check, against the strings that were actually deployed.
+ * ──────────────────────────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Real strings, not invented ones: each was deployed or set in CI, and each cleared the old guard —
+ * a deny-list of exact strings plus a 24-character floor — because it was on no list and was long
+ * enough. If a future edit weakens the floor it fails against evidence rather than against taste.
+ */
+const DEPLOYED_PLACEHOLDERS = [
+  'estate-only-outbox-secret-00000000000000', // 54 lines of a PUBLIC compose file, 40 chars
+  'ci-only-not-a-real-secret-000000000000', // the value 23 CI workflows set, this one included
+  'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4', // 32 chars of base64 alphabet, and only 24 bytes
+  '0'.repeat(64), // right alphabet, right length, no entropy at all
+] as const
+
+/** Names the variable, names the fix, and carries no part of the value. */
+function refusalIsSafe(err: unknown, variable: string, value: string): true {
+  const message = (err as Error).message
+  // The reason this guard exists is that the value was readable. A message carrying it would move
+  // the secret from one public place to the log collector.
+  assert.ok(!message.includes(value), 'the refusal echoed the value')
+  assert.match(message, new RegExp(variable))
+  assert.match(message, /openssl rand -base64 48/)
+  return true
+}
+
+test('THE VALUES THAT SAT IN A PUBLIC REPOSITORY ARE REFUSED, as a scalar', () => {
+  for (const value of DEPLOYED_PLACEHOLDERS) {
+    assert.throws(
+      () => loadEnv({ ...base(), OUTBOX_SIGNING_SECRET: value }),
+      (err: unknown) => refusalIsSafe(err, 'OUTBOX_SIGNING_SECRET', value),
+      `${value.slice(0, 6)}… was accepted as OUTBOX_SIGNING_SECRET`,
+    )
+  }
+})
+
+test('THE SAME BAR ON A LIST ENTRY — a rotation window is not a place the rule relaxes', () => {
+  // The OUTGOING key is the one an attacker already holds if it leaked, so "just for the drain" is
+  // exactly how a placeholder survives the rotation that was supposed to remove it. Second position
+  // on purpose: the first entry being genuine must not vouch for the rest.
+  for (const value of DEPLOYED_PLACEHOLDERS) {
+    assert.throws(
+      () => loadEnv({ ...base(), DEVPLATFORM_INGEST_SECRETS: `${GOOD_SECRET},${value}` }),
+      (err: unknown) => {
+        assert.ok(
+          !(err as Error).message.includes(GOOD_SECRET),
+          'the refusal echoed the good key beside it',
+        )
+        return refusalIsSafe(err, 'DEVPLATFORM_INGEST_SECRETS', value)
+      },
+      `${value.slice(0, 6)}… was accepted as a DEVPLATFORM_INGEST_SECRETS entry`,
+    )
+  }
 })
 
 /* ------------------------------------------------------------------ the secret list */
@@ -129,10 +224,12 @@ test('the ingest secret list refuses a duplicate', () => {
 })
 
 test('the ingest secret list refuses an empty list, a placeholder and a short entry', () => {
+  // An empty list stays this file's own refusal, so the message names the service's variable.
   assert.throws(() => parseSecretList('', 'X'), EnvError)
   assert.throws(() => parseSecretList(' , , ', 'X'), EnvError)
-  assert.throws(() => parseSecretList(`${GOOD_SECRET},changeme`, 'X'), EnvError)
-  assert.throws(() => parseSecretList(`${GOOD_SECRET},short`, 'X'), EnvError)
+  // The entries themselves are the shape check's business now.
+  assert.throws(() => parseSecretList(`${GOOD_SECRET},changeme`, 'X'), SecretError)
+  assert.throws(() => parseSecretList(`${GOOD_SECRET},short`, 'X'), /bytes of key material/)
 })
 
 test('the ingest secret list is frozen', () => {

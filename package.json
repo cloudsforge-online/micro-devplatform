@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/devplatform",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "The developer platform. Developer organisations, projects, environments, API keys, service accounts, OAuth clients, webhook endpoints and secrets, usage, quotas and the application directory. It is the service that issues the credential a third party presents to the public API — so a key is prefix + lookup id + secret, its secret is shown once and stored under scrypt, a wildcard scope grants nothing, revocation is immediate and indistinguishable in timing from an unknown key, and every quota is counted in Postgres rather than in a per-replica variable.",
   "license": "MIT",
@@ -29,6 +29,7 @@
     "@cloudsforge/http": "link:../runtime/packages/http",
     "@cloudsforge/jobs": "link:../runtime/packages/jobs",
     "@cloudsforge/lifecycle": "link:../runtime/packages/lifecycle",
+    "@cloudsforge/secrets": "link:../runtime/packages/secrets",
     "@cloudsforge/telemetry": "link:../runtime/packages/telemetry",
     "postgres": "^3.4.5",
     "tsx": "^4.19.2"
