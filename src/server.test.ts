@@ -44,6 +44,7 @@ import { envelopeDefects, recipientOf } from './topics.ts'
 import { parseKey } from './keys.ts'
 import { MembershipUnavailableError, type MembershipClient, type OrgRole } from './membership.ts'
 import {
+  TEST_KEY_OWNER,
   TEST_PARAMS,
   migrateTestDb,
   openDb,
@@ -914,19 +915,57 @@ test('the server', { skip }, async (t) => {
     assert.equal(events[0]?.n, 1, 'a redelivery emitted a second revocation event')
   })
 
-  await t.test('a deleted USER does not revoke the organisation\'s keys', async () => {
-    // Their keys were issued TO the organisation and remain the organisation's. Revoking them would
-    // take a company's production integration down because an employee closed their account.
+  await t.test('a deleted USER keeps the key live and erases the attribution', async () => {
+    // ════════════════════════════════════════════════════════════════════════════════════════
+    // Two claims, and this branch used to make only the first.
+    //
+    //   1. The key is NOT revoked. It was issued TO the organisation and remains the
+    //      organisation's; revoking it would take a company's production integration down
+    //      because an employee closed their account.
+    //   2. The PERSON is erased from it. `api_keys.created_by` is the only user this service
+    //      knows, and the handler returned `{ revoked: 0 }` without touching it — reporting
+    //      success while leaving the departed developer's `user:<uuid>` on a live credential.
+    //
+    // The old test asserted only `revoked === 0`, which the no-op satisfied perfectly, and it
+    // sent `userId: 'user_gone'` — a value identity cannot produce, since the field is a uuid.
+    // ════════════════════════════════════════════════════════════════════════════════════════
     const { project } = await scenario()
     const issued = await seedKey(sql, project.id)
-    const raw = envelopeFor('identity.user.deleted', { userId: 'user_gone' })
+    const [before] = await sql<{ created_by: string }[]>`
+      select created_by from api_keys where id = ${issued.key.id}`
+    assert.equal(before?.created_by, `user:${TEST_KEY_OWNER}`, 'the fixture proves nothing')
+
+    const raw = envelopeFor('identity.user.deleted', {
+      userId: TEST_KEY_OWNER,
+      tombstoneAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      reason: 'user_requested',
+    })
     const answer = await call('POST', '/v1/events', {
       rawBody: raw,
       headers: { 'cf-signature': signEvent(raw, INGEST_SECRET) },
     })
     assert.equal(answer.status, 202)
     assert.equal(answer.json['revoked'], 0)
+    assert.equal(answer.json['keysReattributed'], 1)
+
+    // The credential still authenticates: the organisation did not lose its integration.
     assert.equal((await call('GET', '/v1/keys/self', { token: issued.secretKey })).status, 200)
+
+    // And nothing in the table names the person any more.
+    const [after] = await sql<{ created_by: string }[]>`
+      select created_by from api_keys where id = ${issued.key.id}`
+    assert.match(after?.created_by ?? '', /^user:erased-/)
+    const [leaks] = await sql<{ n: number }[]>`
+      select count(*)::int as n from api_keys
+       where created_by = ${`user:${TEST_KEY_OWNER}`} or revoked_by = ${`user:${TEST_KEY_OWNER}`}`
+    assert.equal(leaks?.n, 0, 'the erased developer still owns a live credential')
+
+    // The erasure is terminal — no repair script can hand the key back to a real account.
+    await assert.rejects(
+      () => sql`update api_keys set created_by = ${`user:${TEST_KEY_OWNER}`} where id = ${issued.key.id}`,
+      /erased creator/,
+      'an erased key attribution could be restored',
+    )
   })
 
   await t.test('an unsubscribed topic is accepted and ignored with a 202', async () => {

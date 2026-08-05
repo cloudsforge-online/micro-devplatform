@@ -1545,14 +1545,103 @@ function buildRoutes(): Route[] {
         throw new BadRequestError('the event payload must name an organisationId')
       }
 
+      // `payload.userId`, the field identity actually sends (`identity/src/deletion.ts:113-125`),
+      // and NOT `envelope.actor` — on this topic the actor is whoever ASKED for the deletion, which
+      // is the deleted user only when they deleted themselves. The `user:` prefix is stripped if
+      // present because `api_keys.created_by` stores the prefixed form and it is added back once,
+      // explicitly, at the point of comparison.
+      const namedUser = typeof payload['userId'] === 'string' ? payload['userId'] : ''
+      const userDeletedId = namedUser.startsWith('user:') ? namedUser.slice('user:'.length) : namedUser
+      if (topic === USER_DELETED_TOPIC && !UUID.test(userDeletedId)) {
+        throw new BadRequestError('identity.user.deleted requires a uuid userId')
+      }
+
       const done = deps.lifecycle.track()
       try {
         const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
           if (topic === USER_DELETED_TOPIC) {
-            // A deleted user is not a deleted organisation. Their keys were issued TO the
-            // organisation and remain the organisation's — revoking them here would take a
-            // company's production integration down because an employee closed their account.
-            return { revoked: 0, suspended: false }
+            // ══════════════════════════════════════════════════════════════════════════════════
+            // GDPR erasure. This branch USED TO BE `return { revoked: 0, suspended: false }` with
+            // the first three lines below as its whole justification — and those three lines are
+            // right, which is exactly what made the no-op so easy to leave in place. "We correctly
+            // decided not to revoke" is not the same claim as "there is nothing here to erase",
+            // and only the first was ever checked.
+            //
+            // ── WHAT THIS SERVICE ACTUALLY HOLDS ABOUT A PERSON ─────────────────────────────
+            //
+            // There is no `user_id` column anywhere in this schema, and that is not an accident:
+            // `membership.ts` records that identity is ASKED and nothing is mirrored. What is left
+            // is `api_keys.created_by` — written as `actorOf(caller)`, so `user:<uuid>` for the
+            // developer who pressed the button — and `api_keys.revoked_by`, the same vocabulary.
+            // `apikeys.ts:419` already says it in as many words: "`api_keys.created_by` is the
+            // only user this service knows".
+            //
+            // ── PER-TABLE DECISION ──────────────────────────────────────────────────────────
+            //
+            // | table            | action    | reasoning, and basis where retained              |
+            // |------------------|-----------|--------------------------------------------------|
+            // | api_keys         | anonymise | The ROW is retained and the key stays LIVE —     |
+            // |  .created_by     |           | see below. What goes is the attribution: the     |
+            // |  .revoked_by     |           | person's `user:<uuid>` is overwritten with a     |
+            // |                  |           | tombstone. Not nulled: `created_by` is NOT NULL  |
+            // |                  |           | and `api_keys_revoked_has_time` ties             |
+            // |                  |           | `revoked_by` to `revoked_at`, so nulling one     |
+            // |                  |           | would either fail or falsify a revocation time.  |
+            // | api_keys (row)   | RETAIN    | Art. 17(3)(b)/(e). The credential belongs to the |
+            // |  and its secret  |           | ORGANISATION, not to the employee who created    |
+            // |                  |           | it. It is not personal data once the attribution |
+            // |                  |           | is gone: the stored digest is scrypt over a      |
+            // |                  |           | machine credential, `lookup_id` is random, and   |
+            // |                  |           | `scopes` describe a robot's authority. Revoking  |
+            // |                  |           | would take a company's production integration    |
+            // |                  |           | down because an employee closed their account —  |
+            // |                  |           | erasing one person's data by breaking a third    |
+            // |                  |           | party's service is not proportionate, and the    |
+            // |                  |           | org's own deletion event already does revoke.    |
+            // | developer_orgs,  | retain    | Org enrolment, plan, status. No person on any    |
+            // | projects,        |           | of them. Membership is identity's and is never   |
+            // | environments,    |           | mirrored here, so there is no member row to      |
+            // | service_accounts |           | remove — which is why this branch cannot know    |
+            // |                  |           | whether the org still has any humans in it.      |
+            // | oauth_clients,   | retain    | Project-scoped machine credentials and config.   |
+            // | webhook_*        |           | No subject column of any kind.                   |
+            // | usage_events,    | retain    | Keyed on project/environment/api_key. A COUNT of |
+            // | usage_rollups,   |           | requests with no amount, no price and no person. |
+            // | quotas           |           |                                                  |
+            // | applications     | retain    | A public directory listing owned by a project.   |
+            // | inbox            | retain    | The acknowledgement, and Art. 5(2) requires us   |
+            // |                  |           | to be able to demonstrate it. Names an event.    |
+            // | outbox           | retain    | `actor` is the acting principal, `service:       |
+            // |                  |           | identity` on this path. No event is emitted for  |
+            // |                  |           | the erasure — nothing is revoked, so there is    |
+            // |                  |           | no cache to flush and no one to notify.          |
+            //
+            // The tombstone is `crypto.randomUUID()` per erasure, stored nowhere beside the
+            // subject it replaced, so the link is destroyed rather than merely indexed elsewhere.
+            // `ownerUserIdOf` (`apikeys.ts:388`) requires a bare uuid after `user:` and therefore
+            // returns null for it — so if one of these keys is revoked later, `emitKeyRevoked`
+            // omits `userId` entirely and no consumer files a record against a deleted person.
+            // That is the correct downstream behaviour and it falls out of the spelling.
+            //
+            // `api_keys_erased_attribution_is_final` (migration 10) makes it stick: an erased
+            // attribution may not be rewritten to name a real account again.
+            // ══════════════════════════════════════════════════════════════════════════════════
+            const tombstone = `user:erased-${crypto.randomUUID()}`
+            const subject = `user:${userDeletedId}`
+            const created = await tx<{ id: string }[]>`
+              update api_keys set created_by = ${tombstone}
+               where created_by = ${subject} returning id
+            `
+            const revokedBy = await tx<{ id: string }[]>`
+              update api_keys set revoked_by = ${tombstone}
+               where revoked_by = ${subject} returning id
+            `
+            return {
+              revoked: 0,
+              suspended: false,
+              keysReattributed: created.length,
+              revocationsReattributed: revokedBy.length,
+            }
           }
           const org = await findOrgByIdentityId(tx, identityOrgId!)
           if (!org) return { revoked: 0, suspended: false }

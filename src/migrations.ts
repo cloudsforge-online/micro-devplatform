@@ -549,6 +549,62 @@ export const MIGRATIONS: readonly Migration[] = [
         check (slug <> 'pending');
     `,
   },
+
+  {
+    version: 10,
+    name: 'erased-attribution-is-final',
+    up: `
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- AN ERASED KEY ATTRIBUTION MAY NOT BE GIVEN BACK TO A REAL ACCOUNT.
+      --
+      -- \`identity.user.deleted\` overwrites \`created_by\` and \`revoked_by\` with
+      -- \`user:erased-<uuid>\` wherever they named the deleted person, and deliberately leaves the
+      -- key itself LIVE: the credential is the organisation's, and revoking it would take a
+      -- customer's production integration down because an employee closed their account.
+      --
+      -- That choice is what creates the hazard this trigger closes. The row stays in every list,
+      -- every rotation and every support tool, looking exactly like a normal key — so the natural
+      -- thing for a later repair script, a re-import or a "fix the orphaned attribution" ticket to
+      -- do is to write a real \`user:<uuid>\` back into it. Nothing about the value would look
+      -- wrong. It would simply re-attribute a live credential to somebody who asked to be
+      -- forgotten, and the erasure would silently un-happen.
+      --
+      -- One direction only: an erased attribution may not stop being erased. Nothing here says
+      -- which rows must be erased, because almost none ever will be.
+      --
+      -- A CHECK cannot express this — it sees one row, not the transition — so it is a trigger.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      create or replace function devplatform_refuse_reattribution() returns trigger
+        language plpgsql
+      as $$
+      begin
+        if old.created_by like 'user:erased-%' and new.created_by is distinct from old.created_by then
+          raise exception
+            'api key % has an erased creator; it may not be re-attributed to %', old.id, new.created_by
+            using errcode = 'check_violation';
+        end if;
+        if old.revoked_by like 'user:erased-%' and new.revoked_by is distinct from old.revoked_by then
+          raise exception
+            'api key % has an erased revoker; it may not be re-attributed to %', old.id, new.revoked_by
+            using errcode = 'check_violation';
+        end if;
+        return new;
+      end;
+      $$;
+
+      drop trigger if exists api_keys_erased_attribution_is_final on api_keys;
+      create trigger api_keys_erased_attribution_is_final
+        before update on api_keys
+        for each row execute function devplatform_refuse_reattribution();
+
+      -- Erasure looks keys up by the person who created them, which had no index: the existing
+      -- ones are on project, environment and lookup id. Without this, every erasure — including
+      -- the overwhelming majority that match nothing — is a sequential scan of the key table.
+      create index if not exists api_keys_created_by_idx on api_keys (created_by);
+      create index if not exists api_keys_revoked_by_idx on api_keys (revoked_by)
+        where revoked_by is not null;
+    `,
+  },
 ]
 
 /** Every table this service owns. The truncate list for the test harness, and nothing else. */
