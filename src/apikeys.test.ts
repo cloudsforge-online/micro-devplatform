@@ -376,7 +376,7 @@ test('api keys', { skip }, async (t) => {
     const other = await seedKey(sql, theirs.project.id)
     await tx((t) => revokeApiKey(t, { id: b.key.id, revokedBy: 'user:x', reason: 'earlier' }))
 
-    // `service:identity`, the string `server.ts:1575` really passes. `system:identity` stood here
+    // `service:identity`, the string `server.ts` really passes. `system:identity` stood here
     // until contracts registered this topic and proved `system` is the one kind with no subject —
     // and `revoked_by` takes the same string the event's `Actor` does, so a fixture that disagrees
     // with production is a fixture that agrees with a defect.

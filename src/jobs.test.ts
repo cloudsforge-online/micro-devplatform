@@ -65,7 +65,7 @@ function acceptingClient(onRequest?: () => void): Pick<HttpClient, 'request'> {
 /* ------------------------------------------------------------------ the schedule */
 
 test('every recurring job is keyed by the resource it contends on', () => {
-  // `@cloudsforge/jobs` index.ts:16 — the key names the contended resource, not the row. All four
+  // `@cloudsforge/jobs` index.ts — the key names the contended resource, not the row. All four
   // of these contend on a shared range (the outbox stream, the delivery queue, an aggregate upsert,
   // a bulk DELETE), so all four are `global`.
   for (const job of RECURRING) {

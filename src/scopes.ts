@@ -21,13 +21,13 @@
  *
  * There are two scope matchers in this estate and they do not agree:
  *
- *   - `contracts/packages/auth/src/index.ts:209` — `grantsScope` is `granted.includes(required)`.
+ *   - `contracts/packages/auth/src/index.ts` — `grantsScope` is `granted.includes(required)`.
  *     Exact match. Its comment at :201-208 is explicit: "There is no `custody:*`, no
  *     `ledger:write` covering `ledger:post`, and no implication ordering between scopes.
  *     Hierarchy is how a shared token comes back."
- *   - `runtime/packages/auth/src/index.ts:178` — `hasScope` honours ONE wildcard level, so
- *     `ledger:*` does grant `ledger:post` (`index.test.ts:155`). A bare `*` grants nothing
- *     (`:159-162`), which is the part both agree on.
+ *   - `runtime/packages/auth/src/index.ts` — `hasScope` honours ONE wildcard level, so
+ *     `ledger:*` does grant `ledger:post` (`index.test.ts`). A bare `*` grants nothing
+ *, which is the part both agree on.
  *
  * So an internal service token carrying `ledger:*` is treated as omnipotent-within-ledger by the
  * runtime middleware and as meaningless by the contracts helper, depending on which one a given
@@ -41,15 +41,15 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **WHY THIS VOCABULARY IS NOT `contracts-auth`'s.**
  *
- * `contracts/packages/auth/src/index.ts:130-187` is the closed set of **service** scopes: the
+ * `contracts/packages/auth/src/index.ts` is the closed set of **service** scopes: the
  * authority one CloudsForge service holds over another, `custody:sign:treasury` and the like.
  * Handing any of those to a third party would be a category error — `ledger:post` writes journal
  * entries, and nothing outside this estate may do that.
  *
  * The public vocabulary is a different, smaller set, and it is the one a developer sees. It
  * belongs in `@cloudsforge/contracts-devplatform`, which
- * `11-data-and-contract-strategy.md:54` names as the owner of the "scope vocabulary" — and which
- * `18-build-status.md:392` records as one of the four contract packages that have not been cut.
+ * `11-data-and-contract-strategy.md` names as the owner of the "scope vocabulary" — and which
+ * `18-build-status.md` records as one of the four contract packages that have not been cut.
  * Until it is, this is the vocabulary, here, and moving it is a package extraction rather than a
  * redesign.
  * ══════════════════════════════════════════════════════════════════════════════════════════════

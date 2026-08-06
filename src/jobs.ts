@@ -29,7 +29,7 @@
  *                      write amplification on the thing that must be fast during an incident.
  *
  * The lease key is `global` for the three that contend on a shared range, which is the rule
- * `@cloudsforge/jobs` states at `index.ts:16` — **the key names the contended resource, not the
+ * `@cloudsforge/jobs` states at `index.ts` — **the key names the contended resource, not the
  * row.**
  *
  * `jobs.test.ts` proves the property directly: two runners, one due job, exactly one execution.

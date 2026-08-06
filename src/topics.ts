@@ -41,7 +41,7 @@
  * paste.
  *
  * `devplatform.key.revoked` is the one that was never merely tidiness.
- * `11-data-and-contract-strategy.md:363` says key validation is cached 30 s by the gateway and
+ * `11-data-and-contract-strategy.md` says key validation is cached 30 s by the gateway and
  * that "revocation propagates via `devplatform.key.revoked`" — so that topic IS the mechanism by
  * which a revoked API key stops working everywhere rather than only here. While no registry named
  * it, no consumer could classify it, so the documented propagation path did not exist: revocation
@@ -57,7 +57,7 @@
  *
  *   - `server.ts`'s `actorOf` spelled an API-key caller `` `key:${display}` ``. `key` is not an
  *     `ActorKind` — the contract admits `user`, `service`, `operator` and the bare word `system`
- *     (`parseActor`, `contracts/packages/events/src/index.ts:78`) — so every event raised by a
+ *     (`parseActor`, `contracts/packages/events/src/index.ts`) — so every event raised by a
  *     third-party integration was refused whole with `actor: unknown kind "key"`. A `KeyPrincipal`
  *     is not a corner case: it is one of the two principals the customer surface admits.
  *   - the `identity.organisation.deleted` handler passed `'system:identity'`. `system` is the one
@@ -125,15 +125,15 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
   // present and that failure IS the self-emptying quarantine.
   //
   // Registering `key.revoked` is what finally builds the propagation path
-  // `11-data-and-contract-strategy.md:363` describes — a revoked key ceasing to work at every
+  // `11-data-and-contract-strategy.md` describes — a revoked key ceasing to work at every
   // 30-second gateway cache rather than only inside this service. It also removed this service's
   // last hiding place: `activity` quarantined every unregistered `devplatform.*` topic WITHOUT
   // validating the envelope, so an envelope defect on these two cost nothing. It costs everything
   // now. That is how the two `actor` defects below were found, on the day the shelter was removed:
   //
-  //   - `server.ts:702` spelled an API-key caller `key:<display>`, and `key` is not an `ActorKind`.
-  //   - `server.ts:1574-1575` spelled the erasure path `system:identity`, and `system` is the one
-  //     kind that takes NO subject (`parseActor`, contracts index.ts:79).
+  //   - `server.ts` spelled an API-key caller `key:<display>`, and `key` is not an `ActorKind`.
+  //   - `server.ts` spelled the erasure path `system:identity`, and `system` is the one
+  //     kind that takes NO subject (`parseActor`, contracts index.ts).
   //
   // Both are fixed, and `DomainEvent.actor` is now the contract's `Actor` type so neither spelling
   // can be written again — the same trick `version` already used. See `outbox.ts`.
@@ -293,9 +293,9 @@ const UUID_SUBJECT = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
  *
  * ## Whose rule this is, line by line
  *
- * The order is `notify`'s `userIdOf` (`notify/src/catalogue.ts:216-225`), which every rule built
+ * The order is `notify`'s `userIdOf` (`notify/src/catalogue.ts`), which every rule built
  * with `forUser` uses, and which `activity` matches with `userFromPayload` then `userFromActor`
- * (`activity/src/classify.ts:113` and `:148`):
+ * (`activity/src/classify.ts` and):
  *
  *   1. the payload's `user_id` / `userId`;
  *   2. the envelope key, for a topic the registry says is `keyedBy: 'user_id'` — neither of this

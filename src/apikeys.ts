@@ -325,7 +325,7 @@ export async function findApiKey(sql: Tx | Db, id: string): Promise<ApiKeySummar
  *
  * Immediate: the next `authenticateKey` in this service reads `revoked_at` and refuses. The outbox
  * event (`devplatform.key.revoked`) is what makes it immediate everywhere else —
- * `11-data-and-contract-strategy.md:363` records that key validation is cached 30 s at the edge, so
+ * `11-data-and-contract-strategy.md` records that key validation is cached 30 s at the edge, so
  * the event is the mechanism by which that cache is invalidated rather than waited out.
  *
  * Idempotent by claim: `where revoked_at is null` means the second revocation matches no row and
@@ -371,7 +371,7 @@ const USER_ACTOR =
 /**
  * The person whose credential this is, or null when no person holds it.
  *
- * `created_by` is written as `actorOf(caller)` (`server.ts:701`), so it is `user:<uuid>` for a
+ * `created_by` is written as `actorOf(caller)` (`server.ts`), so it is `user:<uuid>` for a
  * developer who pressed the button and `service:<display>` for a key that minted a key. Only the
  * first names somebody, and the uuid is required rather than assumed: `activity` files a record
  * against `activity_records.user_id`, and a subject that is not a uuid is a value no feed query
@@ -395,11 +395,11 @@ export function ownerUserIdOf(createdBy: string): string | null {
  *
  * Until this field existed, they were forced to be. Every consumer in the estate derives the owner
  * of an event from the ENVELOPE ACTOR when the payload names nobody — `activity`'s `userFromActor`
- * (`activity/src/classify.ts:148`) and `notify`'s `userIdOf` (`notify/src/catalogue.ts:216`) both
- * fall back to it — and that is right for the route at `server.ts:999`, where a developer presses
+ * (`activity/src/classify.ts`) and `notify`'s `userIdOf` (`notify/src/catalogue.ts`) both
+ * fall back to it — and that is right for the route at `server.ts`, where a developer presses
  * DELETE and the actor is that developer.
  *
- * It is wrong for the other caller, and wrong in the case that matters most. `server.ts:1575`
+ * It is wrong for the other caller, and wrong in the case that matters most. `server.ts`
  * handles `identity.organisation.deleted`: it suspends the organisation and revokes EVERY live key
  * it holds, as `service:identity`, because that IS who acted. So the actor named a service, both
  * consumers correctly answered "no user on this envelope", `activity` filed the record internal as
@@ -419,7 +419,7 @@ export function ownerUserIdOf(createdBy: string): string | null {
  *      `api_keys.created_by` is the only user this service knows, and it is already on the row
  *      `revokeOrgKeys` returns.
  *   2. **A revoked key is per-key news whatever revoked it.** The registry keys this topic by
- *      `key_id` and `11-data-and-contract-strategy.md:363` names it as the estate's key-cache
+ *      `key_id` and `11-data-and-contract-strategy.md` names it as the estate's key-cache
  *      flush, so a per-key event has to exist regardless. Collapsing N keys into one event would
  *      break the flush to save a field.
  *
@@ -434,7 +434,7 @@ export function ownerUserIdOf(createdBy: string): string | null {
  *
  * The field is added HERE rather than at either call site, so `emitKeyRevoked` still has exactly
  * one payload shape. `micro-contracts` checked precisely that before registering this topic ("One
- * payload shape each", `contracts/packages/events/src/index.ts:697`) — a `TopicSpec` gives a topic
+ * payload shape each", `contracts/packages/events/src/index.ts`) — a `TopicSpec` gives a topic
  * one `payloadType`, and a payload that differs by which path produced it is unregisterable by
  * construction, which is what made `identity.mfa.changed` impossible to adopt. `userId` is absent,
  * never null or empty, when no person holds the key: an absent field and a null read identically
@@ -596,7 +596,7 @@ export async function touchLastUsed(sql: Db, keyId: string): Promise<void> {
 /**
  * What `GET /v1/keys/self` answers — the whoami this estate did not have.
  *
- * See the README: `identity/src/server.ts:540` refuses a service token on `GET /auth/me`, and an
+ * See the README: `identity/src/server.ts` refuses a service token on `GET /auth/me`, and an
  * API key is not a JWT at all, so identity could not answer this even if it wanted to. The service
  * that issued the credential is the service that can introspect it.
  */

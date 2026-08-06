@@ -4,13 +4,13 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **IDENTITY IS ASKED. NOTHING IS MIRRORED.**
  *
- * `07-dependency-map.md:143` makes `devplatform → identity` a HARD dependency for "developer
+ * `07-dependency-map.md` makes `devplatform → identity` a HARD dependency for "developer
  * organisation and membership", and `orgs.ts` holds no membership rows at all. This is the file
  * that pays for that decision: every request that acts on an organisation asks identity whether the
  * caller belongs to it.
  *
  * The alternative — a mirrored `memberships` table fed by `identity.membership.changed` — is what
- * most services would do, and it is wrong here for one reason. `11-data-and-contract-strategy.md:349`
+ * most services would do, and it is wrong here for one reason. `11-data-and-contract-strategy.md`
  * prices the staleness this estate accepts for mirrored identity data at 60 seconds. Sixty seconds
  * is fine for rendering a list of organisations. It is not fine for deciding who may MINT A
  * CREDENTIAL: the minute after someone is removed from a company is precisely the minute they would
@@ -19,7 +19,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **THE CALLER'S OWN TOKEN IS FORWARDED. THIS SERVICE HOLDS NO OMNIPOTENT CREDENTIAL.**
  *
- * `identity`'s `GET /organisations/:id/memberships` (`identity/src/server.ts:1219`) authenticates
+ * `identity`'s `GET /organisations/:id/memberships` (`identity/src/server.ts`) authenticates
  * the caller as a USER and answers 404 to a non-member. So devplatform forwards the developer's own
  * bearer token and reads the answer. It therefore needs no service token that can read anybody's
  * membership — which is the shape of the two omnipotent tokens SD-05 exists to retire, and the
@@ -33,7 +33,7 @@
  * **AN OUTAGE IS 503, NEVER 403.** If identity cannot be reached we do not KNOW whether the caller
  * is a member, and answering "no" would lock every developer out of their own platform for the
  * duration of somebody else's incident. This is the same rule `runtime/packages/auth` states for
- * token verification (`index.ts:10-16`) and it is got backwards at least as often.
+ * token verification (`index.ts`) and it is got backwards at least as often.
  */
 
 import { HttpClient, HttpError } from '@cloudsforge/http'

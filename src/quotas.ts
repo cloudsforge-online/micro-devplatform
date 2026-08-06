@@ -64,8 +64,8 @@ export const API_REQUESTS = 'api_requests'
  * stops them drifting apart.
  *
  * The values are not a judgement about what a plan should be. Each is the largest value this
- * service's own configuration already permits to be seeded into these rows (`env.ts:210` for a
- * minute window, `env.ts:211` for every longer one), so a legal configuration can never be refused
+ * service's own configuration already permits to be seeded into these rows (`env.ts` for a
+ * minute window, `env.ts` for every longer one), so a legal configuration can never be refused
  * by the constraint guarding the rows it seeds.
  */
 export const MAX_UNITS_CEILING: Readonly<Record<Period, number>> = Object.freeze({
@@ -384,7 +384,7 @@ export interface UsageRollup {
  *
  * Re-runs over the last few hours rather than only the newest: the current hour is incomplete every
  * time it is written, so the upsert has to CORRECT it rather than assume it is final. The rollups
- * are what survive retention — 11-data-and-contract-strategy.md:304 commits to notifying every
+ * are what survive retention — 11-data-and-contract-strategy.md commits to notifying every
  * project that called an endpoint in the last 90 days before it is removed, and raw events are kept
  * for 35. That question is answerable only from this table.
  */

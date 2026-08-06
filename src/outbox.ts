@@ -12,7 +12,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **THE EVENT THAT MATTERS: A REVOKED KEY.**
  *
- * `11-data-and-contract-strategy.md:363` says key validation is "cached 30 s" by the gateway and
+ * `11-data-and-contract-strategy.md` says key validation is "cached 30 s" by the gateway and
  * that "revocation propagates via `devplatform.key.revoked`". So the outbox row written in the
  * same transaction as the revocation is the mechanism by which a revoked key actually stops
  * working at every cache in the estate. Revocation is immediate in *this* service — the row is
@@ -113,10 +113,10 @@ export interface DomainEvent {
    * applied to the field that had quietly acquired the identical defect.
    *
    * This was `string`, and a `string` is what let two unspellable actors reach the wire and stay
-   * there. `server.ts:702` returned `` `key:${display}` `` for an API-key caller, and
-   * `server.ts:1575` passed `'system:identity'` from the organisation-erasure path. The contract
+   * there. `server.ts` returned `` `key:${display}` `` for an API-key caller, and
+   * `server.ts` passed `'system:identity'` from the organisation-erasure path. The contract
    * admits `user`, `service`, `operator` and the BARE word `system` and nothing else
-   * (`parseActor`, `contracts/packages/events/src/index.ts:78`), so both were refused on arrival
+   * (`parseActor`, `contracts/packages/events/src/index.ts`), so both were refused on arrival
    * with `actor: unknown kind …` — the whole envelope discarded before any consumer read a
    * payload, which is precisely how the integer `version` cost six producers every event they ever
    * relayed.
@@ -210,7 +210,7 @@ export async function emitOn(tx: Tx, producer: string, event: DomainEvent): Prom
  * `@cloudsforge/contracts-events`.
  *
  * Chosen over a bare `sha256=<hex>` MAC because the timestamp is in the signed material, so a
- * captured delivery cannot be replayed outside the tolerance window. `activity/src/ingest.ts:82`
+ * captured delivery cannot be replayed outside the tolerance window. `activity/src/ingest.ts`
  * is the sibling that already uses it.
  */
 export function signEvent(body: string, secret: string, at?: number): string {

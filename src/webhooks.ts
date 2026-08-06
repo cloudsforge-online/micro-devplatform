@@ -419,7 +419,7 @@ export async function claimDeliveries(
     ...toDelivery(row),
     // A parameterised `unsafe` query returns jsonb as text, while the tagged-template path returns
     // it parsed. Normalised here so a handler is never handed a payload whose type depends on how
-    // the query was issued — the same defect `@cloudsforge/jobs` documents at index.ts:202.
+    // the query was issued — the same defect `@cloudsforge/jobs` documents at index.ts.
     payload:
       typeof row.payload === 'string'
         ? (JSON.parse(row.payload) as Record<string, unknown>)

@@ -200,7 +200,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   if (usageRollupRetentionDays < usageEventRetentionDays) {
     // A rollup that expires before the events it summarises is a summary thrown away while its
     // inputs survive — the inversion of what the rollup is for. It also breaks the one commitment
-    // 11-data-and-contract-strategy.md:304 makes to developers: usage-gated removal notifies every
+    // 11-data-and-contract-strategy.md makes to developers: usage-gated removal notifies every
     // project that called an endpoint in the last 90 days, and that question is answered here.
     throw new EnvError(
       `DEVPLATFORM_USAGE_ROLLUP_RETENTION_DAYS (${usageRollupRetentionDays}) must be at least ` +

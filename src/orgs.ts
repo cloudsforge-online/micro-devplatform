@@ -4,8 +4,8 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **IDENTITY OWNS ORGANISATIONS. THIS SERVICE OWNS THEIR ENROLMENT.**
  *
- * `07-dependency-map.md:143` makes `devplatform → identity` a **hard** dependency for
- * "Developer organisation and membership", and `02-target-architecture.md:401-402` states the
+ * `07-dependency-map.md` makes `devplatform → identity` a **hard** dependency for
+ * "Developer organisation and membership", and `02-target-architecture.md` states the
  * division in one sentence: "Identity issues *the token*; devplatform issues *the credential that
  * requests the token*. Devplatform is a client of identity, exactly like every other product."
  *
@@ -13,7 +13,7 @@
  * slug a developer sees — and holds **no membership rows at all**. Membership is asked of identity
  * on the request that needs it. A mirrored membership table is a membership that can be stale at
  * exactly the moment somebody is removed from an organisation, which is the moment it matters, and
- * `11-data-and-contract-strategy.md:349` prices the staleness this estate accepts for that data at
+ * `11-data-and-contract-strategy.md` prices the staleness this estate accepts for that data at
  * 60 seconds — acceptable for rendering a list, not for deciding who may mint a credential.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *

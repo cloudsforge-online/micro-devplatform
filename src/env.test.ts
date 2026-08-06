@@ -39,7 +39,7 @@ function base(): Record<string, string> {
 // `env.ts` validates `process.env` at IMPORT and exits the process on a bad configuration — right
 // for a service, fatal for a test runner. So populate a valid environment first, then import it
 // dynamically. `loadEnv` itself is pure over its source, so every case below passes an explicit
-// object and never touches `process.env`. The estate's pattern; `lantern/src/env.test.ts:21` is the
+// object and never touches `process.env`. The estate's pattern; `lantern/src/env.test.ts` is the
 // sibling that documents it.
 for (const [key, value] of Object.entries(base())) process.env[key] = value
 const { EnvError, SERVICE, loadEnv, parseSecretList } = await import('./env.ts')

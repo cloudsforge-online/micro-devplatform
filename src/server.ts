@@ -22,11 +22,11 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **`GET /v1/keys/self` IS THE WHOAMI A MACHINE CREDENTIAL DID NOT HAVE.**
  *
- * 18-build-status.md §3.3d(4): `identity/src/server.ts:540` refuses a service token on
+ * 18-build-status.md §3.3d(4): `identity/src/server.ts` refuses a service token on
  * `GET /auth/me`, so a machine credential has no way to ask what it is. That finding is correct and
  * its remedy is not in identity, for a reason the finding could not have known before this service
  * existed: **an API key is not a JWT.** `identity`'s `/auth/me` verifies a signed token and reads
- * its claims (`authenticate` at `identity/src/server.ts:513`); a `cfk_live_…` string has no
+ * its claims (`authenticate` at `identity/src/server.ts`); a `cfk_live_…` string has no
  * signature, no claims and no issuer, and identity holds neither the row nor the scrypt hash that
  * would let it decide anything about one. Relaxing line 540 would let a SERVICE token — a different
  * credential entirely — read `/auth/me`, which is a separate question and one this service does not
@@ -60,7 +60,7 @@
  *   a SERVICE token carrying the exact scope `devplatform:admin`, or
  *   a USER token carrying the platform role `admin` (`runtime/packages/auth`'s `Role`, :24).
  *
- * — which is `market/src/server.ts:1335-1342`'s `requireOperator`, adopted rather than reinvented.
+ * — which is `market/src/server.ts`'s `requireOperator`, adopted rather than reinvented.
  * **An API key is never an operator**, whatever it carries: `devplatform:admin` is deliberately
  * absent from `scopes.ts`, so `validateScopes` refuses it at issuance and a key cannot hold it.
  *
@@ -557,7 +557,7 @@ function isOperator(caller: AnyPrincipal): boolean {
   return false
 }
 
-/** `market/src/server.ts:1335`'s shape: the scope or the role, and nothing else. */
+/** `market/src/server.ts`'s shape: the scope or the role, and nothing else. */
 function requireOperator(caller: AnyPrincipal): void {
   if (!isOperator(caller)) throw new ForbiddenError(`${ADMIN_SCOPE} or role:admin`)
 }
@@ -673,7 +673,7 @@ async function roleInOrg(
  * The return type is the contract's `Actor` rather than `string`, and that is the whole repair.
  * This function used to spell an API-key caller `` `key:${caller.key.display}` ``, and `key` is not
  * an `ActorKind`: the contract admits `user`, `service`, `operator` and the bare word `system`
- * (`parseActor`, `contracts/packages/events/src/index.ts:78`) and answers anything else with
+ * (`parseActor`, `contracts/packages/events/src/index.ts`) and answers anything else with
  * `actor: unknown kind "key"`. Every event this function's result reached — a project created, a
  * key issued, a key revoked, a webhook endpoint registered — was therefore an envelope every
  * consumer in the estate refuses, whenever the caller authenticated with a key rather than a
@@ -685,8 +685,8 @@ async function roleInOrg(
  * registered. `micro-contracts` `8889373` registered `devplatform.key.issued` and
  * `devplatform.key.revoked`, so those two are now validated on arrival and this became live.
  *
- * `service:` is the kind, matching `billing/src/server.ts:660`, `custody/src/server.ts:802`,
- * `market/src/server.ts:1493` and `beacon/src/server.ts:910`, every one of which maps its non-user
+ * `service:` is the kind, matching `billing/src/server.ts`, `custody/src/server.ts`,
+ * `market/src/server.ts` and `beacon/src/server.ts`, every one of which maps its non-user
  * principal to `service:`. devplatform was the only service in the estate that invented a fifth
  * kind. The subject stays `key.display` and not `key.id`: the display is the identifier an operator
  * actually finds in a log line (`apikeys.ts`, `revokeByDisplay`), it is not secret, and an actor
@@ -985,7 +985,7 @@ function buildRoutes(): Route[] {
      * emits no second event.
      *
      * Immediate here; the outbox event is what makes it immediate at the edge, where
-     * 11-data-and-contract-strategy.md:363 records a 30-second validation cache.
+     * 11-data-and-contract-strategy.md records a 30-second validation cache.
      */
     define('DELETE', '/v1/keys/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
@@ -1204,7 +1204,7 @@ function buildRoutes(): Route[] {
      * of what its operator intended. Two verbs cannot be inverted.
      *
      * Deliveries enqueued while it was disabled are NOT replayed — `enqueueDeliveries` selects
-     * `where e.disabled_at is null` (`webhooks.ts:380`), so nothing was queued. That is stated
+     * `where e.disabled_at is null` (`webhooks.ts`), so nothing was queued. That is stated
      * because the
      * opposite is the reasonable assumption, and an operator who assumed it would wait for a flood
      * that never comes.
@@ -1545,7 +1545,7 @@ function buildRoutes(): Route[] {
         throw new BadRequestError('the event payload must name an organisationId')
       }
 
-      // `payload.userId`, the field identity actually sends (`identity/src/deletion.ts:113-125`),
+      // `payload.userId`, the field identity actually sends (`identity/src/deletion.ts`),
       // and NOT `envelope.actor` — on this topic the actor is whoever ASKED for the deletion, which
       // is the deleted user only when they deleted themselves. The `user:` prefix is stripped if
       // present because `api_keys.created_by` stores the prefixed form and it is added back once,
@@ -1573,7 +1573,7 @@ function buildRoutes(): Route[] {
             // `membership.ts` records that identity is ASKED and nothing is mirrored. What is left
             // is `api_keys.created_by` — written as `actorOf(caller)`, so `user:<uuid>` for the
             // developer who pressed the button — and `api_keys.revoked_by`, the same vocabulary.
-            // `apikeys.ts:419` already says it in as many words: "`api_keys.created_by` is the
+            // `apikeys.ts` already says it in as many words: "`api_keys.created_by` is the
             // only user this service knows".
             //
             // ── PER-TABLE DECISION ──────────────────────────────────────────────────────────
@@ -1618,7 +1618,7 @@ function buildRoutes(): Route[] {
             //
             // The tombstone is `crypto.randomUUID()` per erasure, stored nowhere beside the
             // subject it replaced, so the link is destroyed rather than merely indexed elsewhere.
-            // `ownerUserIdOf` (`apikeys.ts:388`) requires a bare uuid after `user:` and therefore
+            // `ownerUserIdOf` (`apikeys.ts`) requires a bare uuid after `user:` and therefore
             // returns null for it — so if one of these keys is revoked later, `emitKeyRevoked`
             // omits `userId` entirely and no consumer files a record against a deleted person.
             // That is the correct downstream behaviour and it falls out of the spelling.
@@ -1648,7 +1648,7 @@ function buildRoutes(): Route[] {
           await setOrgStatus(tx, org.id, 'suspended')
           // `service:identity`, NOT `system:identity`. `system` is the one actor kind that takes no
           // subject — `parseActor` matches the bare word and then refuses `system:` as an unknown
-          // kind (`contracts/packages/events/src/index.ts:79`) — so every event this path emitted
+          // kind (`contracts/packages/events/src/index.ts`) — so every event this path emitted
           // was an envelope the estate refuses with `actor: unknown kind "system"`. It was
           // invisible while `devplatform.key.revoked` was unregistered, because `activity`
           // quarantines an unclassifiable topic without validating; `micro-contracts` `8889373`

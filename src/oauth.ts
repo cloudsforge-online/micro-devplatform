@@ -4,7 +4,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **WHAT THIS FILE DELIBERATELY DOES NOT CONTAIN: A TOKEN ENDPOINT.**
  *
- * `@cloudsforge/sdk`'s `clientCredentials` (`sdk/packages/sdk/src/credentials.ts:109`) takes its
+ * `@cloudsforge/sdk`'s `clientCredentials` (`sdk/packages/sdk/src/credentials.ts`) takes its
  * `tokenUrl` from the caller, with no default, and says why: devplatform did not exist and a
  * default would be a URL the SDK invented. The obvious thing to do here is to invent it —
  * `POST /v1/oauth/token`, mint a JWT, done.
@@ -12,7 +12,7 @@
  * That would be wrong, and it is worth writing down why rather than leaving the gap looking like an
  * omission. Minting an access token means signing it with the key the estate's JWKS publishes, and
  * that key is identity's. `runtime/packages/auth`'s `Verifier` checks `issuer` and fetches
- * `IDENTITY_JWKS_URL` (`index.ts:103-106`), so a token signed by devplatform verifies nowhere. The
+ * `IDENTITY_JWKS_URL` (`index.ts`), so a token signed by devplatform verifies nowhere. The
  * alternatives are both worse than the gap:
  *
  *   1. **Devplatform gets a signing key of its own** and every service in the estate gains a second

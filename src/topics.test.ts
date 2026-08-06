@@ -170,7 +170,7 @@ test('a pending proposal disappears once contracts adopts it', () => {
   )
   // And the split, pinned, so moving a topic across the line is a deliberate edit here.
   // `devplatform.key.revoked` being on the registered side is the one that changes behaviour
-  // rather than tidiness: `11-data-and-contract-strategy.md:363` names it as the mechanism by
+  // rather than tidiness: `11-data-and-contract-strategy.md` names it as the mechanism by
   // which a revoked key stops working at every 30-second gateway cache in the estate, and until
   // 8889373 no consumer could classify it, so that propagation path did not exist.
   assert.deepEqual(topicsProducedBy(SERVICE), ['devplatform.key.issued', 'devplatform.key.revoked'])
@@ -225,7 +225,7 @@ test('the key each registered topic is emitted with is the key the registry says
  * ## The two defects this exists because of
  *
  * `Actor` admits `user:`, `service:`, `operator:` and the BARE word `system`
- * (`contracts/packages/events/src/index.ts:78`). This service wrote two strings that are none of
+ * (`contracts/packages/events/src/index.ts`). This service wrote two strings that are none of
  * those, for the whole life of the service:
  *
  *   - `server.ts`'s `actorOf` returned `` `key:${display}` `` for an API-key caller — one of the
@@ -273,11 +273,11 @@ const KEY_FIXTURE = {
 
 /** Every actor a real code path in this service passes, and the site that passes it. */
 const REAL_ACTORS: readonly { readonly actor: Actor; readonly where: string }[] = [
-  // `actorOf` for a UserPrincipal — server.ts:701.
+  // `actorOf` for a UserPrincipal — server.ts.
   { actor: `user:${'018f0000-0000-7000-8000-0000000000c1'}`, where: 'actorOf, user caller' },
-  // `actorOf` for a KeyPrincipal — server.ts:701. Was `key:${display}`, refused by every consumer.
+  // `actorOf` for a KeyPrincipal — server.ts. Was `key:${display}`, refused by every consumer.
   { actor: `service:${KEY_FIXTURE.display}`, where: 'actorOf, API-key caller' },
-  // The erasure path — server.ts:1574-1575. Was `system:identity`, refused by every consumer.
+  // The erasure path — server.ts. Was `system:identity`, refused by every consumer.
   { actor: 'service:identity', where: 'identity.organisation.deleted handler' },
   // The relay's own fallback when a row has no actor at all — outbox.ts `buildEnvelope`.
   { actor: 'service:devplatform', where: 'buildEnvelope fallback' },
@@ -306,7 +306,7 @@ test('both emitKeyRevoked callers, and emitKeyIssued, build an envelope the cont
       assert.equal(isRegisteredTopic(event.topic), true, `${event.topic} is no longer registered`)
 
       // Through the COLUMN — `string | null`, which is what the database gives back — and out
-      // through the one function that builds an envelope. `emitInTx` (server.ts:1612) writes
+      // through the one function that builds an envelope. `emitInTx` (server.ts) writes
       // `event.actor ?? null` into exactly this column.
       const envelope = buildEnvelope({
         ...ROW,
@@ -493,7 +493,7 @@ function revocationEnvelope(key: typeof KEY_FIXTURE, actor: Actor): Record<strin
 const OWNER = '018f0000-0000-7000-8000-0000000000c1'
 
 test('A KEY THE PLATFORM REVOKES REACHES ITS OWNER, WHO IS NOT THE ACTOR', () => {
-  // The erasure path — server.ts:1575. `service:identity` is the honest actor and is not a person.
+  // The erasure path — server.ts. `service:identity` is the honest actor and is not a person.
   const envelope = revocationEnvelope(KEY_FIXTURE, 'service:identity')
 
   // Yesterday, FIRST. A perfectly valid envelope that lands on nobody: the gap, reproduced.
@@ -517,14 +517,14 @@ test('A KEY THE PLATFORM REVOKES REACHES ITS OWNER, WHO IS NOT THE ACTOR', () =>
   )
 
   // And the platform is STILL the platform. `activity` discriminates `api.key_revoked_by_platform`
-  // from `api.key_revoked` on the actor alone (`activity/src/classify.ts:1096`), so naming the
+  // from `api.key_revoked` on the actor alone (`activity/src/classify.ts`), so naming the
   // owner must not make an erasure read as something the owner did.
   assert.equal(envelope['actor'], 'service:identity')
   assert.deepEqual(envelopeDefects(envelope), [])
 })
 
 test('the owner is read from the key, not from whoever pressed delete', () => {
-  // server.ts:999, where an ADMIN revokes a key a COLLEAGUE created. The actor is the admin; the
+  // server.ts, where an ADMIN revokes a key a COLLEAGUE created. The actor is the admin; the
   // integration that stops belongs to the colleague, and it is the colleague who has to fix it.
   const admin = '018f0000-0000-7000-8000-0000000000c9'
   const envelope = revocationEnvelope(KEY_FIXTURE, `user:${admin}`)
@@ -540,7 +540,7 @@ test('the owner is read from the key, not from whoever pressed delete', () => {
 test('a key minted by a key names nobody, rather than guessing', () => {
   // `actorOf` for a KeyPrincipal is `service:<display>`, so `created_by` names no person. notify's
   // own rule is that this must stay silent: "a key minting a key is no person's news, and guessing
-  // would tell the wrong person that their credentials changed" (notify/src/catalogue.ts:717).
+  // would tell the wrong person that their credentials changed" (notify/src/catalogue.ts).
   // Absent rather than null or empty — an absent field is the only one that does not claim to have
   // answered.
   const serviceOwned = { ...KEY_FIXTURE, createdBy: `service:${KEY_FIXTURE.display}` }
@@ -561,7 +561,7 @@ test('a key minted by a key names nobody, rather than guessing', () => {
 
 test('the recipient reader is the consumers\' order, and can answer null', () => {
   // The model is only worth anything if it can fail. Each branch, in the order notify's `userIdOf`
-  // applies them (`notify/src/catalogue.ts:216`).
+  // applies them (`notify/src/catalogue.ts`).
   const base = revocationEnvelope(KEY_FIXTURE, 'service:identity')
   assert.equal(recipientOf({ ...base, payload: {}, actor: 'service:identity' }), null)
   assert.equal(recipientOf({ ...base, payload: {}, actor: `user:${OWNER}` }), OWNER)
@@ -579,7 +579,7 @@ test('the recipient reader is the consumers\' order, and can answer null', () =>
 /**
  * A guard that proves a topic name is correct proves nothing about whether the emit is reached.
  *
- * `identity/src/sessions.ts:390` exports `emitSessionRevoked` and NOTHING CALLS IT — `revokeSession`
+ * `identity/src/sessions.ts` exports `emitSessionRevoked` and NOTHING CALLS IT — `revokeSession`
  * and `revokeAllSessions` update rows without emitting — so `identity.session.revoked` is produced
  * by dead code while identity's own guard passes, because it scans literals rather than
  * reachability. This is the cheapest check that catches that exact shape.
@@ -590,7 +590,7 @@ test('the recipient reader is the consumers\' order, and can answer null', () =>
  * './foo.ts'` line mentions it, so a symbol that was imported and then never called read as
  * reached. That is not hypothetical: deleting BOTH `emitKeyRevoked` call sites from `server.ts` and
  * leaving its import left this suite fully green, with `devplatform.key.revoked` — the topic
- * `11-data-and-contract-strategy.md:363` names as the estate's key-cache flush — produced by
+ * `11-data-and-contract-strategy.md` names as the estate's key-cache flush — produced by
  * nothing at all. The check could not fail in exactly the case it was written for, because the
  * import that survives a deleted call is the FIRST thing a reader would delete last.
  *

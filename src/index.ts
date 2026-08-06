@@ -13,7 +13,7 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **IDENTITY IS A SOFT PROBE, NOT A HARD ONE, AND THAT IS DELIBERATE.**
  *
- * `07-dependency-map.md:143` makes identity a HARD dependency for developer organisation and
+ * `07-dependency-map.md` makes identity a HARD dependency for developer organisation and
  * membership — and it is, for the console routes, which answer 503 when it is unreachable
  * (`membership.ts`). But `/internal/keys/verify` needs no identity at all: verifying a `cfk_…`
  * string is a row in this database and a scrypt run, and nothing else.

@@ -135,7 +135,7 @@ export async function seedWorkspace(
  * The default owner of a seeded key, as an `Actor` and with a UUID subject.
  *
  * This was `'user_test'`, which is neither. `created_by` is written as `actorOf(caller)` in
- * production (`server.ts:701`), and since `emitKeyRevoked` now derives the revocation's `userId`
+ * production (`server.ts`), and since `emitKeyRevoked` now derives the revocation's `userId`
  * from that column, a fixture in a shape no code path produces would have let every seeded key
  * emit an event that reaches nobody while the suite stayed green — the fixture answering the
  * question instead of the service, which is the failure `topics.test.ts` was rewritten to stop.

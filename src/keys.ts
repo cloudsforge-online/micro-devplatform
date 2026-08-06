@@ -51,7 +51,7 @@
  * credential is how expensive one guess is. SHA-256 makes a guess free.
  *
  * The estate already made this decision and already found the defect in the naive version.
- * `identity/src/passwords.ts:1-19` records it: Nimbus called `scrypt` at library defaults and
+ * `identity/src/passwords.ts` records it: Nimbus called `scrypt` at library defaults and
  * stored two hex strings, so nothing in the row said what cost produced them — and a work factor
  * that cannot be raised without a forced reset for every user is a work factor that never gets
  * raised. `verifyPassword` there reads its parameters FROM the row rather than from a constant.
@@ -82,7 +82,7 @@ import { promisify } from 'node:util'
 /**
  * `promisify` picks the first overload — the one WITHOUT options — so the cost parameters would be
  * silently dropped and every hash would land at library defaults. That is the exact defect
- * `identity/src/passwords.ts:24-28` documents. The signature is restated so the compiler enforces
+ * `identity/src/passwords.ts` documents. The signature is restated so the compiler enforces
  * that the options object is passed.
  */
 const scryptAsync = promisify(scrypt) as (
@@ -215,7 +215,7 @@ export interface ScryptParams {
 /**
  * What this build hashes at.
  *
- * N=16384 matches `identity/src/passwords.ts:57` — the same cost the estate already uses for
+ * N=16384 matches `identity/src/passwords.ts` — the same cost the estate already uses for
  * passwords, which is the right comparison because this table is a password table. Raising it is
  * a one-line change here and nothing else: every existing row keeps verifying under its own
  * recorded parameters and is re-hashed on its next successful use.
