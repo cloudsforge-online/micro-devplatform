@@ -38,6 +38,43 @@
 
 import { HttpClient, HttpError } from '@cloudsforge/http'
 
+/**
+ * **None, and the header above has already given the reason — this is that sentence in a form
+ * `derive-grants.mjs` can read.**
+ *
+ * `identityMembership` builds its `HttpClient` with a base url, a name, a deadline and two retries
+ * and **no `token` option** (:133). The only credential that ever reaches identity from this module
+ * is the developer's own bearer, attached per request at :146 and forwarded verbatim, because
+ * identity's `GET /organisations/:id/memberships` authenticates the caller as a USER and answers
+ * 404 to a non-member. There is therefore no service token here to scope, and a scope on one would
+ * be worse than useless: a devplatform credential able to read anybody's membership is precisely
+ * one of the two omnipotent tokens SD-05 exists to retire, which is the same reason `env.ts` has no
+ * `DEVPLATFORM_ADMIN_TOKEN`.
+ *
+ * It is stated rather than left silent because `micro-deploy`'s `derive-grants.mjs` reads any
+ * module that builds an `HttpClient` and names a bearer ANYWHERE in the file as one presenting an
+ * estate credential (`NAMES_A_BEARER`, `deploy/scripts/derive-grants.mjs:280`), and by that test
+ * this file — which says `authorization` in as many words at :146 — qualifies. The test is
+ * deliberately loose and should stay that way: narrowing it to the constructor call once missed
+ * `admin-api/src/upstreams.ts`, which attaches its bearer sixteen lines after building the client,
+ * and a false negative there produces NO grant at all rather than a wrong one. So the module that
+ * knows the answer is the one that says it.
+ *
+ * Until now it was said somewhere else. `micro-deploy` carried a hand-written entry for this file
+ * in `compose/estate/grant-gaps.json` reading `"scopes": []`, with this repository's own header
+ * quoted back at it as the reason. That is a copy of a fact that lives here, and copies rot: the
+ * entry is deleted in the same window as this line lands, so the estate is never in a state where a
+ * gap is recorded for a module that no longer has one.
+ *
+ * `Object.freeze([])` and not `NO_SCOPES_REQUIRED` — which is the spelling to prefer, and is what
+ * `foresight/src/pricingclient.ts` and `tessera/src/upstreams.ts` use — for one boring reason:
+ * `@cloudsforge/contracts-auth` is not a dependency of this repository, and taking one on so that a
+ * constant can be empty in a better-looking way would put a new package into this service's image
+ * build for no runtime effect. `indexer/src/rpc.ts:162` made the same call for the same reason, and
+ * the derivation reads both forms identically (`derive-grants.mjs:387`, `:407`).
+ */
+export const IDENTITY_SCOPES: readonly string[] = Object.freeze([])
+
 /** Identity's vocabulary, restated. See the note in the README on the uncut contracts package. */
 export const ORG_ROLES = Object.freeze(['owner', 'admin', 'member', 'billing', 'read'] as const)
 export type OrgRole = (typeof ORG_ROLES)[number]
