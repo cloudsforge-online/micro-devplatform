@@ -58,6 +58,29 @@ import {
 
 const INGEST_SECRET = 'an-ingest-secret-of-sufficient-length'
 
+/**
+ * Wait, if the minute is nearly over, for the next one to start.
+ *
+ * `quotas.ts`'s `windowStart` truncates to the CALENDAR minute, so a burst that straddles :59.98
+ * is counted against two windows and the second half is allowed. That is the limiter behaving as
+ * designed — a fixed window, which is what makes the increment a single UPDATE — but a test that
+ * spends a minute quota across several HTTP calls fails whenever it happens to run at the boundary.
+ *
+ * It did, on CI, on 2026-08-10: 'the meter enforces the quota in Postgres' asserted at 15:42:00.013
+ * after opening at 15:41:59.9 — a green branch that changed one version string went red. A test
+ * that can fail for a reason that is not the defect it names is a test that gets rerun until it
+ * passes, which is the same as no test.
+ *
+ * The three calls it guards take ~90ms; a second of headroom is ten times what they need, and the
+ * wait is paid at most once per case and only in the last second of a minute.
+ */
+async function withinOneMinuteWindow(): Promise<void> {
+  const msIntoMinute = Date.now() % 60_000
+  const remaining = 60_000 - msIntoMinute
+  if (remaining > 1_000) return
+  await new Promise((resolve) => setTimeout(resolve, remaining + 20))
+}
+
 /** A verifier that hands back whatever the token says, so a case can be exactly one principal. */
 function fakeVerifier(): PrincipalVerifier & { setPrincipal(token: string, p: Principal): void } {
   const table = new Map<string, Principal>()
@@ -661,6 +684,7 @@ test('the server', { skip }, async (t) => {
     const service = serviceToken([INTROSPECT_SCOPE])
     const meter = () => call('POST', '/internal/usage', { token: service, body: { keyId, route: '/v1/rates' } })
 
+    await withinOneMinuteWindow()
     assert.equal((await meter()).json['allowed'], true)
     assert.equal((await meter()).json['allowed'], true)
     const refused = await meter()
@@ -684,6 +708,8 @@ test('the server', { skip }, async (t) => {
     })
 
     const service = serviceToken([INTROSPECT_SCOPE])
+    // Same boundary hazard: 25 concurrent calls that straddle it would see 10 allowed, not 5.
+    await withinOneMinuteWindow()
     const answers = await Promise.all(
       Array.from({ length: 25 }, () =>
         call('POST', '/internal/usage', { token: service, body: { keyId, route: '/v1/rates' } }),
