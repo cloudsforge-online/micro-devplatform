@@ -96,6 +96,8 @@ import {
 } from 'node:http'
 import { ForbiddenError, TokenError, bearerFrom, statusFor, type Principal } from '@cloudsforge/auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import type { Actor } from '@cloudsforge/contracts-events'
 import { SIGNATURE_HEADER, withInbox, withOutbox, type Db, type Emit, type Tx } from './outbox.ts'
@@ -229,7 +231,16 @@ export interface ServerDeps {
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
   readonly membership: MembershipClient
-  readonly sql: Db
+  /**
+   * The per-network SELECTOR, not a handle. Routes use `ctx.sql`; `NetworkSql` has no query
+   * methods, so reaching for the process-wide handle does not compile.
+   */
+  readonly sql: NetworkSql
+  /**
+   * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
+   * for `pnpm dev`, which has no gateway in front of it. Never set in production.
+   */
+  readonly singleNetwork?: Network
   readonly producer: string
   /** Verifies inbound event signatures on `POST /v1/events`. A LIST, so rotation has an overlap. */
   readonly ingestSecrets: readonly string[]
@@ -316,7 +327,32 @@ interface RequestContext {
   readonly requestId: string
   readonly log: Logger
   readonly params: Readonly<Record<string, string>>
+  /**
+   * The network THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both estates since the network consolidation
+   * (micro-deploy `docs/network-consolidation.md`), so "which network am I" has no answer.
+   */
+  readonly network: Network
+  /**
+   * The database handle for `network`, resolved ONCE, at the edge of the request.
+   *
+   * Every route uses this rather than reaching for the process-wide handle, because a wrong handle
+   * is not an error — it is a query that SUCCEEDS against the other estate's rows and says nothing.
+   * `deps.sql` is a `NetworkSql` with no query methods, so the mistake does not compile.
+   */
+  readonly sql: Db
 }
+
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them makes every health probe a 500 and the pod never
+ * becomes ready. Three literal paths rather than a prefix, because this is an exemption from a data
+ * boundary; none of them queries the database.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
 
 interface Route {
   readonly method: string
@@ -391,23 +427,61 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ──────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a cross-network write nothing would ever flag.
+    //
+    // The operational endpoints are exempt because kubelet and Prometheus do not come through the
+    // gateway and never send the header. Refusing them makes the pod never become ready.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    const sql = deps.sql.for(network) as unknown as Db
+    void handle(matched, { req, url, requestId, log, params, network, sql }, deps)
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -511,14 +585,14 @@ async function authenticateAny(ctx: RequestContext, deps: ServerDeps): Promise<A
   if (!token) throw new UnauthenticatedError('missing')
 
   if (token.startsWith('cfk_')) {
-    const outcome = await authenticateKey(deps.sql, token, {
+    const outcome = await authenticateKey(ctx.sql, token, {
       ...(deps.kdf ? { kdf: deps.kdf } : {}),
       ...(deps.scryptParams ? { params: deps.scryptParams } : {}),
     })
     if (!outcome.ok) throw new UnauthenticatedError(outcome.reason)
     // Fire and forget. An awaited UPDATE per authenticated request serialises every concurrent
     // caller of one key on one row; the write is coarsened to once a minute inside `touchLastUsed`.
-    void touchLastUsed(deps.sql, outcome.key.id).catch(() => undefined)
+    void touchLastUsed(ctx.sql, outcome.key.id).catch(() => undefined)
     return { kind: 'key', key: outcome.key, orgId: outcome.orgId }
   }
 
@@ -607,7 +681,7 @@ async function authoriseProject(
   projectId: string,
   need: 'read' | 'write',
 ): Promise<{ caller: CallerPrincipal; project: Project }> {
-  return authoriseProjectAs(await authenticate(ctx, deps), deps, projectId, need)
+  return authoriseProjectAs(ctx.sql, await authenticate(ctx, deps), deps, projectId, need)
 }
 
 /**
@@ -618,12 +692,13 @@ async function authoriseProject(
  * The body is unchanged; `authoriseProject` is now the two-line wrapper it always was.
  */
 async function authoriseProjectAs(
+  sql: Db,
   caller: CallerPrincipal,
   deps: ServerDeps,
   projectId: string,
   need: 'read' | 'write',
 ): Promise<{ caller: CallerPrincipal; project: Project }> {
-  const project = await findProject(deps.sql, projectId)
+  const project = await findProject(sql, projectId)
   // 404 rather than 403 for a project the caller cannot see. A 403 confirms the id exists, which
   // makes project ids enumerable across customers.
   if (!project) throw new NotFoundError('no such project')
@@ -636,7 +711,7 @@ async function authoriseProjectAs(
     return { caller, project }
   }
 
-  const role = await roleInOrg(deps, caller, project.orgId)
+  const role = await roleInOrg(sql, deps, caller, project.orgId)
   if (!permits(role, need === 'write' ? ADMIN_ROLES : READ_ROLES)) {
     throw new NotFoundError('no such project')
   }
@@ -650,7 +725,7 @@ async function authoriseOrg(
   need: 'read' | 'write',
 ): Promise<UserPrincipal> {
   const caller = await authenticateUser(ctx, deps)
-  const role = await roleInOrg(deps, caller, orgId)
+  const role = await roleInOrg(ctx.sql, deps, caller, orgId)
   if (!permits(role, need === 'write' ? ADMIN_ROLES : READ_ROLES)) {
     throw new NotFoundError('no such developer organisation')
   }
@@ -658,11 +733,12 @@ async function authoriseOrg(
 }
 
 async function roleInOrg(
+  sql: Db,
   deps: ServerDeps,
   caller: UserPrincipal,
   orgId: string,
 ): Promise<OrgRole | null> {
-  const org = await findOrg(deps.sql, orgId)
+  const org = await findOrg(sql, orgId)
   if (!org) return null
   return deps.membership.roleFor(caller.token, org.identityOrgId, caller.userId)
 }
@@ -784,7 +860,7 @@ function buildRoutes(): Route[] {
       const role = await deps.membership.roleFor(caller.token, identityOrgId, caller.userId)
       if (!permits(role, ADMIN_ROLES)) throw new ForbiddenError('an owner or admin of the organisation')
 
-      const org = await enrolOrg(deps.sql, {
+      const org = await enrolOrg(ctx.sql, {
         identityOrgId,
         name: requireString(body, 'name'),
         slug: requireString(body, 'slug'),
@@ -824,14 +900,14 @@ function buildRoutes(): Route[] {
       }
       const role = await deps.membership.roleFor(caller.token, identityOrgId, caller.userId)
       if (!permits(role, READ_ROLES)) throw new NotFoundError('no such developer organisation')
-      const org = await findOrgByIdentityId(deps.sql, identityOrgId)
+      const org = await findOrgByIdentityId(ctx.sql, identityOrgId)
       return { status: 200, body: { organisations: org ? [org] : [] } }
     }),
 
     define('GET', '/v1/organisations/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
       await authoriseOrg(ctx, deps, id, 'read')
-      const org = await findOrg(deps.sql, id)
+      const org = await findOrg(ctx.sql, id)
       if (!org) throw new NotFoundError('no such developer organisation')
       return { status: 200, body: { organisation: org } }
     }),
@@ -839,7 +915,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/organisations/:id/projects', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
       await authoriseOrg(ctx, deps, id, 'read')
-      return { status: 200, body: { projects: await listProjects(deps.sql, id) } }
+      return { status: 200, body: { projects: await listProjects(ctx.sql, id) } }
     }),
 
     /* ---------------------------------------------------------------- projects */
@@ -882,7 +958,7 @@ function buildRoutes(): Route[] {
     define('POST', '/v1/projects/:id/service-accounts', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'write')
       const body = await readJson(ctx.req)
-      const account = await createServiceAccount(deps.sql, {
+      const account = await createServiceAccount(ctx.sql, {
         projectId: project.id,
         name: requireString(body, 'name'),
         description: optionalString(body, 'description') ?? '',
@@ -892,7 +968,7 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/projects/:id/service-accounts', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'read')
-      return { status: 200, body: { serviceAccounts: await listServiceAccounts(deps.sql, project.id) } }
+      return { status: 200, body: { serviceAccounts: await listServiceAccounts(ctx.sql, project.id) } }
     }),
 
     /* ---------------------------------------------------------------- keys */
@@ -968,12 +1044,12 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/projects/:id/keys', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'read')
       const includeRevoked = ctx.url.searchParams.get('includeRevoked') === 'true'
-      const keys = await listApiKeys(deps.sql, project.id, { includeRevoked })
+      const keys = await listApiKeys(ctx.sql, project.id, { includeRevoked })
       return { status: 200, body: { keys } }
     }),
 
     define('GET', '/v1/keys/:id', async (ctx, deps) => {
-      const key = await findApiKey(deps.sql, ctx.params['id'] ?? '')
+      const key = await findApiKey(ctx.sql, ctx.params['id'] ?? '')
       if (!key) throw new NotFoundError('no such api key')
       await authoriseProject(ctx, deps, key.projectId, 'read')
       return { status: 200, body: { key } }
@@ -989,12 +1065,12 @@ function buildRoutes(): Route[] {
      */
     define('DELETE', '/v1/keys/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
-      const existing = await findApiKey(deps.sql, id)
+      const existing = await findApiKey(ctx.sql, id)
       if (!existing) throw new NotFoundError('no such api key')
       const { caller } = await authoriseProject(ctx, deps, existing.projectId, 'write')
       const reason = ctx.url.searchParams.get('reason') ?? ''
 
-      const outcome = await withOutbox(deps.sql, deps.producer, async (tx, emit) => {
+      const outcome = await withOutbox(ctx.sql, deps.producer, async (tx, emit) => {
         const revoked = await revokeApiKey(tx, { id, revokedBy: actorOf(caller), reason })
         if (!revoked.alreadyRevoked) emitKeyRevoked(emit, revoked.key, actorOf(caller))
         return revoked
@@ -1056,21 +1132,21 @@ function buildRoutes(): Route[] {
       if (operator) {
         // No membership check. An operator setting a customer's limit is the platform acting on
         // the customer, and requiring membership would mean joining every organisation to do it.
-        const found = await findProject(deps.sql, requireUuid(ctx.params['id'] ?? '', 'project id'))
+        const found = await findProject(ctx.sql, requireUuid(ctx.params['id'] ?? '', 'project id'))
         if (!found) throw new NotFoundError('no such project')
         project = found
       } else if (caller.kind === 'service') {
         // A service token with no operator scope. Not "close enough" — see the file header.
         throw new ForbiddenError(`${ADMIN_SCOPE} or role:admin`)
       } else {
-        ;({ project } = await authoriseProjectAs(caller, deps, ctx.params['id'] ?? '', 'write'))
+        ;({ project } = await authoriseProjectAs(ctx.sql, caller, deps, ctx.params['id'] ?? '', 'write'))
       }
 
-      const target = await findEnvironment(deps.sql, project.id, environment)
+      const target = await findEnvironment(ctx.sql, project.id, environment)
       if (!target) throw new NotFoundError('no such project environment')
 
       if (!operator) {
-        const current = await findQuota(deps.sql, target.id, period)
+        const current = await findQuota(ctx.sql, target.id, period)
         if (!current) {
           throw new ForbiddenError(
             `${ADMIN_SCOPE} or role:admin — this environment has no ${period} quota, and creating ` +
@@ -1085,7 +1161,7 @@ function buildRoutes(): Route[] {
         }
       }
 
-      const quota = await setQuota(deps.sql, {
+      const quota = await setQuota(ctx.sql, {
         projectId: project.id,
         environmentId: target.id,
         period,
@@ -1096,17 +1172,17 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/projects/:id/quotas', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'read')
-      const quotas = await listQuotas(deps.sql, project.id)
+      const quotas = await listQuotas(ctx.sql, project.id)
       const windows: Record<string, unknown> = {}
       for (const environment of project.environments) {
-        windows[environment.name] = await currentUsage(deps.sql, environment.id)
+        windows[environment.name] = await currentUsage(ctx.sql, environment.id)
       }
       return { status: 200, body: { quotas, current: windows } }
     }),
 
     define('GET', '/v1/projects/:id/usage', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'read')
-      const usage = await listUsage(deps.sql, project.id, {
+      const usage = await listUsage(ctx.sql, project.id, {
         limit: clampLimit(ctx.url.searchParams.get('limit'), 200, 1_000),
       })
       return { status: 200, body: { usage } }
@@ -1118,7 +1194,7 @@ function buildRoutes(): Route[] {
       const { project, caller } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'write')
       const body = await readJson(ctx.req)
       const environment = requireEnvironment(body)
-      const target = await findEnvironment(deps.sql, project.id, environment)
+      const target = await findEnvironment(ctx.sql, project.id, environment)
       if (!target) throw new NotFoundError('no such project environment')
 
       let secret: string | null = null
@@ -1147,7 +1223,7 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/projects/:id/webhook-endpoints', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'read')
-      return { status: 200, body: { endpoints: await listEndpoints(deps.sql, project.id) } }
+      return { status: 200, body: { endpoints: await listEndpoints(ctx.sql, project.id) } }
     }),
 
     /**
@@ -1156,7 +1232,7 @@ function buildRoutes(): Route[] {
      */
     define('POST', '/v1/webhook-endpoints/:id/rotate-secret', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
-      const endpoint = await findEndpoint(deps.sql, id)
+      const endpoint = await findEndpoint(ctx.sql, id)
       if (!endpoint) throw new NotFoundError('no such webhook endpoint')
       const { caller } = await authoriseProject(ctx, deps, endpoint.projectId, 'write')
 
@@ -1187,12 +1263,12 @@ function buildRoutes(): Route[] {
      */
     define('POST', '/v1/webhook-endpoints/:id/disable', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
-      const endpoint = await findEndpoint(deps.sql, id)
+      const endpoint = await findEndpoint(ctx.sql, id)
       if (!endpoint) throw new NotFoundError('no such webhook endpoint')
       await authoriseProject(ctx, deps, endpoint.projectId, 'write')
       // A state transition claimed on a column; the second attempt writes the same value. There is
       // no second artefact a retry could create.
-      return { status: 200, body: { endpoint: await setEndpointDisabled(deps.sql, id, true) } }
+      return { status: 200, body: { endpoint: await setEndpointDisabled(ctx.sql, id, true) } }
     }),
 
     /**
@@ -1211,29 +1287,29 @@ function buildRoutes(): Route[] {
      */
     define('POST', '/v1/webhook-endpoints/:id/enable', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
-      const endpoint = await findEndpoint(deps.sql, id)
+      const endpoint = await findEndpoint(ctx.sql, id)
       if (!endpoint) throw new NotFoundError('no such webhook endpoint')
       await authoriseProject(ctx, deps, endpoint.projectId, 'write')
       // Same shape as `/disable`: a state transition writing a fixed value, so the second attempt
       // writes the same value and creates no second artefact.
-      return { status: 200, body: { endpoint: await setEndpointDisabled(deps.sql, id, false) } }
+      return { status: 200, body: { endpoint: await setEndpointDisabled(ctx.sql, id, false) } }
     }),
 
     define('DELETE', '/v1/webhook-endpoints/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
-      const endpoint = await findEndpoint(deps.sql, id)
+      const endpoint = await findEndpoint(ctx.sql, id)
       if (!endpoint) throw new NotFoundError('no such webhook endpoint')
       await authoriseProject(ctx, deps, endpoint.projectId, 'write')
-      await deleteEndpoint(deps.sql, id)
+      await deleteEndpoint(ctx.sql, id)
       return { status: 200, body: { deleted: true } }
     }),
 
     define('GET', '/v1/webhook-endpoints/:id/deliveries', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
-      const endpoint = await findEndpoint(deps.sql, id)
+      const endpoint = await findEndpoint(ctx.sql, id)
       if (!endpoint) throw new NotFoundError('no such webhook endpoint')
       await authoriseProject(ctx, deps, endpoint.projectId, 'read')
-      return { status: 200, body: { deliveries: await listDeliveries(deps.sql, id) } }
+      return { status: 200, body: { deliveries: await listDeliveries(ctx.sql, id) } }
     }),
 
     /* ---------------------------------------------------------------- oauth clients */
@@ -1277,18 +1353,18 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/projects/:id/oauth-clients', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'read')
-      return { status: 200, body: { clients: await listClients(deps.sql, project.id) } }
+      return { status: 200, body: { clients: await listClients(ctx.sql, project.id) } }
     }),
 
     define('DELETE', '/v1/oauth-clients/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? ''
-      const rows = await deps.sql<{ project_id: string }[]>`
+      const rows = await ctx.sql<{ project_id: string }[]>`
         select project_id from oauth_clients where id = ${id}
       `
       const row = rows[0]
       if (!row) throw new NotFoundError('no such oauth client')
       await authoriseProject(ctx, deps, row.project_id, 'write')
-      return { status: 200, body: { client: await revokeClient(deps.sql, id) } }
+      return { status: 200, body: { client: await revokeClient(ctx.sql, id) } }
     }),
 
     /* ---------------------------------------------------------------- the directory */
@@ -1296,7 +1372,7 @@ function buildRoutes(): Route[] {
     /** Public. `listDirectory` filters to `status = 'listed'` inside the query, not at the caller. */
     define('GET', '/v1/apps', async (ctx, deps) => ({
       status: 200,
-      body: { applications: await listDirectory(deps.sql, { limit: clampLimit(ctx.url.searchParams.get('limit'), 100, 500) }) },
+      body: { applications: await listDirectory(ctx.sql, { limit: clampLimit(ctx.url.searchParams.get('limit'), 100, 500) }) },
     })),
 
     /**
@@ -1316,14 +1392,14 @@ function buildRoutes(): Route[] {
      */
     define('GET', '/v1/apps/pending', async (ctx, deps) => {
       requireOperator(await authenticateAny(ctx, deps))
-      const applications = await listForReview(deps.sql, {
+      const applications = await listForReview(ctx.sql, {
         limit: clampLimit(ctx.url.searchParams.get('limit'), 100, 500),
       })
       return { status: 200, body: { applications } }
     }),
 
     define('GET', '/v1/apps/:slug', async (ctx, deps) => {
-      const application = await findListedApplication(deps.sql, ctx.params['slug'] ?? '')
+      const application = await findListedApplication(ctx.sql, ctx.params['slug'] ?? '')
       if (!application) throw new NotFoundError('no such application')
       return { status: 200, body: { application } }
     }),
@@ -1332,7 +1408,7 @@ function buildRoutes(): Route[] {
     define('PUT', '/v1/projects/:id/application', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'write')
       const body = await readJson(ctx.req)
-      const application = await upsertApplication(deps.sql, {
+      const application = await upsertApplication(ctx.sql, {
         projectId: project.id,
         slug: requireString(body, 'slug'),
         name: requireString(body, 'name'),
@@ -1345,7 +1421,7 @@ function buildRoutes(): Route[] {
 
     define('GET', '/v1/projects/:id/application', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'read')
-      const application = await findApplicationByProject(deps.sql, project.id)
+      const application = await findApplicationByProject(ctx.sql, project.id)
       if (!application) throw new NotFoundError('this project has no application listing')
       return { status: 200, body: { application } }
     }),
@@ -1353,7 +1429,7 @@ function buildRoutes(): Route[] {
     /** A state transition claimed with `where status in (…)`; the second attempt matches no row. */
     define('POST', '/v1/projects/:id/application/submit', async (ctx, deps) => {
       const { project } = await authoriseProject(ctx, deps, ctx.params['id'] ?? '', 'write')
-      return { status: 200, body: { application: await submitForReview(deps.sql, project.id) } }
+      return { status: 200, body: { application: await submitForReview(ctx.sql, project.id) } }
     }),
 
     /**
@@ -1383,7 +1459,7 @@ function buildRoutes(): Route[] {
         throw new BadRequestError(`status must be one of ${OPERATOR_STATUSES.join(', ')}`)
       }
       const projectId = requireUuid(ctx.params['id'] ?? '', 'project id')
-      const application = await setApplicationStatus(deps.sql, projectId, status)
+      const application = await setApplicationStatus(ctx.sql, projectId, status)
       ctx.log.info('an application status was decided', { projectId, status })
       return { status: 200, body: { application } }
     }),
@@ -1407,7 +1483,7 @@ function buildRoutes(): Route[] {
       await authenticateService(ctx, deps, INTROSPECT_SCOPE)
       const body = await readJson(ctx.req)
       const presented = requireString(body, 'key')
-      const outcome = await authenticateKey(deps.sql, presented, {
+      const outcome = await authenticateKey(ctx.sql, presented, {
         ...(deps.kdf ? { kdf: deps.kdf } : {}),
         ...(deps.scryptParams ? { params: deps.scryptParams } : {}),
       })
@@ -1418,7 +1494,7 @@ function buildRoutes(): Route[] {
         // downstream behaviour.
         return { status: 200, body: { ok: false } }
       }
-      void touchLastUsed(deps.sql, outcome.key.id).catch(() => undefined)
+      void touchLastUsed(ctx.sql, outcome.key.id).catch(() => undefined)
       return { status: 200, body: { ok: true, principal: introspect(outcome.key, outcome.orgId) } }
     }),
 
@@ -1427,7 +1503,7 @@ function buildRoutes(): Route[] {
       await authenticateService(ctx, deps, INTROSPECT_SCOPE)
       const body = await readJson(ctx.req)
       const outcome = await verifyClientSecret(
-        deps.sql,
+        ctx.sql,
         requireString(body, 'clientId'),
         requireString(body, 'clientSecret'),
         {
@@ -1460,14 +1536,14 @@ function buildRoutes(): Route[] {
     define('POST', '/internal/usage', async (ctx, deps) => {
       await authenticateService(ctx, deps, INTROSPECT_SCOPE)
       const body = await readJson(ctx.req)
-      const key = await findApiKey(deps.sql, requireString(body, 'keyId'))
+      const key = await findApiKey(ctx.sql, requireString(body, 'keyId'))
       if (!key) throw new NotFoundError('no such api key')
 
-      const quotas = await quotasFor(deps.sql, key.environmentId, API_REQUESTS)
-      const decision = await consumeAll(deps.sql, quotas, 1)
+      const quotas = await quotasFor(ctx.sql, key.environmentId, API_REQUESTS)
+      const decision = await consumeAll(ctx.sql, quotas, 1)
       const status = typeof body['status'] === 'number' ? body['status'] : decision.allowed ? 200 : 429
 
-      await recordUsage(deps.sql, {
+      await recordUsage(ctx.sql, {
         projectId: key.projectId,
         environmentId: key.environmentId,
         apiKeyId: key.id,
@@ -1481,7 +1557,7 @@ function buildRoutes(): Route[] {
         deps.metrics.increment('devplatform_quota_refusals_total', { period: exceeded.period })
         const quota = quotas.find((candidate) => candidate.period === exceeded.period)
         if (quota) {
-          await withOutbox(deps.sql, deps.producer, async (_tx, emit) => {
+          await withOutbox(ctx.sql, deps.producer, async (_tx, emit) => {
             emitQuotaExceeded(emit, quota, exceeded)
           })
         }
@@ -1558,7 +1634,7 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track()
       try {
-        const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+        const outcome = await withInbox(ctx.sql, topic, eventId, async (tx) => {
           if (topic === USER_DELETED_TOPIC) {
             // ══════════════════════════════════════════════════════════════════════════════════
             // GDPR erasure. This branch USED TO BE `return { revoked: 0, suspended: false }` with
@@ -1729,7 +1805,7 @@ async function withIdempotentRoute(
       'an Idempotency-Key header of 8 to 200 characters is required on every mutating request',
     )
   }
-  const outcome = await withIdempotency<Record<string, unknown>>(deps.sql, {
+  const outcome = await withIdempotency<Record<string, unknown>>(ctx.sql, {
     principal,
     route,
     clientKey: key,

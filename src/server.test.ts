@@ -23,6 +23,7 @@
  * rather than jose's signature checking, which `runtime/packages/auth` already proves.
  */
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
@@ -134,7 +135,8 @@ test('the server', { skip }, async (t) => {
     metrics: registerServiceMetrics(registerHttpMetrics(new Metrics())),
     verifier,
     membership,
-    sql: store,
+    sql: singleNetworkSql(store),
+    singleNetwork: 'mainnet' as const,
     producer: 'devplatform',
     ingestSecrets: [INGEST_SECRET],
     defaultQuotaPerMinute: 600,
@@ -1630,3 +1632,12 @@ test('the server', { skip }, async (t) => {
     assert.equal(answer.status, 400)
   })
 })
+
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}
